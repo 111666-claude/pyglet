@@ -128,6 +128,10 @@ class DDSImageDecoder(codecs.ImageDecoder):
 
         width = desc.dwWidth
         height = desc.dwHeight
+        if width <= 0 or height <= 0:
+            raise ImageDecodeException(
+                'Invalid DDS file (non-positive dimensions: %dx%d).'
+                % (width, height))
         mipmaps = 1
 
         if desc.dwFlags & DDSD_DEPTH:
@@ -135,6 +139,9 @@ class DDSImageDecoder(codecs.ImageDecoder):
 
         if desc.dwFlags & DDSD_MIPMAPCOUNT:
             mipmaps = desc.dwMipMapCount
+            if mipmaps == 0:
+                raise ImageDecodeException(
+                    'Invalid DDS file (mipmap count is zero).')
 
         if desc.ddpfPixelFormat.dwSize != 32:
             raise ImageDecodeException('Invalid DDS file (incorrect pixel format).')
@@ -152,14 +159,16 @@ class DDSImageDecoder(codecs.ImageDecoder):
             raise ImageDecodeException('Unsupported texture compression %s' % desc.ddpfPixelFormat.dwFourCC)
 
         dformat, decoder = _compression_formats[selector]
-        if dformat == GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+        # Block size depends only on the FourCC: every DXT1 block (RGB or
+        # RGBA) is 8 bytes; DXT3/DXT5 blocks are 16 bytes.
+        if desc.ddpfPixelFormat.dwFourCC == b'DXT1':
             block_size = 8
         else:
             block_size = 16
 
         datas = []
         w, h = width, height
-        for i in range(mipmaps):
+        for level in range(mipmaps):
             if not w and not h:
                 break
             if not w:
@@ -168,9 +177,19 @@ class DDSImageDecoder(codecs.ImageDecoder):
                 h = 1
             size = ((w + 3) // 4) * ((h + 3) // 4) * block_size
             data = file.read(size)
+            if len(data) != size:
+                raise ImageDecodeException(
+                    'Truncated DDS file: mipmap level %d needs %d bytes, '
+                    'only %d available.' % (level, size, len(data)))
             datas.append(data)
             w >>= 1
             h >>= 1
+
+        expected_base_size = ((width + 3) // 4) * ((height + 3) // 4) * block_size
+        if len(datas[0]) != expected_base_size:
+            raise ImageDecodeException(
+                'Truncated DDS file: base level needs %d bytes, got %d.'
+                % (expected_base_size, len(datas[0])))
 
         image = CompressedImageData(width, height, dformat, datas[0], 'GL_EXT_texture_compression_s3tc', decoder)
         level = 0
