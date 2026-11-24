@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import errno
 import time
 import ctypes
 import warnings
@@ -175,6 +176,18 @@ def EVIOCGABS(fileno, abs):
     return _IOR_len('E', 0x40 + abs)(fileno, buffer)
 
 
+# KEY_MAX (0x2ff) is the highest possible key code, so the key state bitmap
+# always fits in KEY_MAX // 8 + 1 bytes. Used to resynchronize after SYN_DROPPED:
+# https://www.kernel.org/doc/html/latest/input/input.html#event-interface
+_EVIOCGKEY = _IOR_len('E', 0x18)
+
+
+def EVIOCGKEY(fileno):
+    buffer = (ctypes.c_byte * (KEY_MAX // 8 + 1))()
+    _EVIOCGKEY(fileno, buffer)
+    return buffer
+
+
 def get_set_bits(bytestring):
     bits = set()
     j = 0
@@ -306,6 +319,9 @@ class EvdevDevice(XlibSelectDevice, Device):
 
         self._event_size = ctypes.sizeof(InputEvent)
         self._event_buffer = (InputEvent * 64)()
+        # True between a SYN_DROPPED marker and the SYN_REPORT that closes the
+        # dropped interval; survives readv() calls if the buffer fills mid-frame.
+        self._resync_pending = False
 
         super().__init__(display, name)
 
@@ -353,19 +369,103 @@ class EvdevDevice(XlibSelectDevice, Device):
     def poll(self):
         return False
 
+    @staticmethod
+    def _set_control_value(control, value):
+        """Apply a resynchronized kernel state to a Control.
+
+        Unlike the normal event path, this must never fabricate a release for
+        a button that never produced an initial press: before the first real
+        event a Button's internal value is ``None``, and the regular setter
+        would turn the first resync into a spurious on_release.
+        """
+        if isinstance(control, Button):
+            value = bool(value)
+            if control._value is None:
+                # First state we ever observe for this button: adopt it
+                # silently without dispatching press/release events.
+                control._value = int(value)
+                return
+        control.value = value
+
+    def _resync_state(self):
+        """Re-read the current kernel state after a SYN_DROPPED event.
+
+        The kernel guarantees that once SYN_DROPPED is delivered, the state
+        queried through EVIOCGKEY/EVIOCGABS reflects all events that happened
+        before the drop. Relative axes have no queryable state and are simply
+        left untouched, so no synthetic motion is generated.
+
+        Returns True if the device is still usable, False if it disappeared.
+        """
+        try:
+            key_bits = get_set_bits(EVIOCGKEY(self._fileno))
+        except OSError as e:
+            if e.errno in (errno.EIO, errno.ENODEV, errno.EBADF):
+                return False
+            warnings.warn(f"{self}: unable to resync key state after "
+                          f"SYN_DROPPED ({e}); button state may be stale.")
+            key_bits = None
+
+        for control in self.controls:
+            if control.event_type == EV_KEY and key_bits is not None:
+                self._set_control_value(control, control.event_code in key_bits)
+            elif control.event_type == EV_ABS:
+                try:
+                    absinfo = EVIOCGABS(self._fileno, control.event_code)
+                except OSError as e:
+                    if e.errno in (errno.EIO, errno.ENODEV, errno.EBADF):
+                        return False
+                    # Some drivers do not support the ioctl for every axis;
+                    # keep the last known value rather than failing recovery.
+                    warnings.warn(f"{self}: unable to resync {control.raw_name} "
+                                  f"after SYN_DROPPED ({e}); axis state may be stale.")
+                    continue
+                self._set_control_value(control, absinfo.value)
+        return True
+
     def select(self):
         if not self._fileno:
             return
 
         try:
             bytes_read = _readv(self._fileno, self._event_buffer)
-        except OSError:
+        except OSError as e:
+            # A non-blocking fd can legitimately return these if select()
+            # raced another reader; only give up on genuine device failures.
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                return
             self.close()
             return
 
+        # A zero-length read means the device was removed, and a short read
+        # must never be parsed past the complete event records it contains.
+        if not bytes_read:
+            self.close()
+            return
         n_events = bytes_read // self._event_size
 
+        # While set, events belong to the gap reported by SYN_DROPPED and must
+        # be discarded until the next SYN_REPORT re-establishes a sync point.
         for event in self._event_buffer[:n_events]:
+            if event.type == EV_SYN:
+                if event.code == SYN_DROPPED:
+                    self._resync_pending = True
+                    continue
+                if event.code == SYN_REPORT and self._resync_pending:
+                    # Sync boundary: query the authoritative kernel state
+                    # once, then resume normal event processing.
+                    if not self._resync_state():
+                        self.close()
+                        return
+                    self._resync_pending = False
+                # SYN_REPORT/SYN_CONFIG carry no control state themselves.
+                continue
+
+            if self._resync_pending:
+                # Stale event from inside the dropped interval: ignore it so
+                # it cannot leave keys or axes diverging from the kernel.
+                continue
+
             try:
                 self.control_map[(event.type, event.code)].value = event.value
             except KeyError:
