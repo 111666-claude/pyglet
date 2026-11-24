@@ -18,27 +18,25 @@ class TestDefaultShader(unittest.TestCase):
         """Setup the fake ShaderProgram for all of the tests."""
         patcher = patch.multiple(
             'pyglet.graphics.shader',
-            _link_program=patch('pyglet.graphics.shader._link_program', return_value=1).start(),
-            _introspect_attributes=patch('pyglet.graphics.shader._introspect_attributes',
-                                         return_value=default_shader_attributes).start(),
-            _introspect_uniforms=patch('pyglet.graphics.shader._introspect_uniforms',
-                                       return_value={}).start(),
-            _introspect_uniform_blocks=patch('pyglet.graphics.shader._introspect_uniform_blocks',
-                                             return_value={}).start(),
-            glEnableVertexAttribArray=patch('pyglet.graphics.shader.glEnableVertexAttribArray', new_callable=MagicMock()).start(),
-            glVertexAttribPointer=patch('pyglet.graphics.shader.glVertexAttribPointer',
-                                            new_callable=MagicMock()).start(),
+            _link_program=MagicMock(return_value=1),
+            _introspect_attributes=MagicMock(return_value=default_shader_attributes),
+            _introspect_uniforms=MagicMock(return_value={}),
+            _introspect_uniform_blocks=MagicMock(return_value={}),
+            glEnableVertexAttribArray=MagicMock(),
+            glVertexAttribPointer=MagicMock(),
         )
         self.addCleanup(patcher.stop)
+        patcher.start()
 
         patcher_gl = patch.multiple(
             'pyglet.gl',
-            current_context=patch('pyglet.gl.current_context', create=True).start(),
-            glUseProgram=patch('pyglet.gl.glUseProgram').start(),
-            glDeleteProgram=patch('pyglet.gl.glDeleteProgram').start(),
-            glGenVertexArrays=patch('pyglet.gl.glGenVertexArrays').start(),
+            current_context=MagicMock(),
+            glUseProgram=MagicMock(),
+            glDeleteProgram=MagicMock(),
+            glGenVertexArrays=MagicMock(),
         )
         self.addCleanup(patcher_gl.stop)
+        patcher_gl.start()
         
         # These are imported already before this test runs, so we need to override them. Imports fixed.
         patcher_vertexbuffer = patch.multiple(
@@ -67,7 +65,9 @@ class TestDefaultShader(unittest.TestCase):
         from pyglet.graphics.shader import ShaderProgram
 
         # Patch default batch.
-        patch('pyglet.graphics.get_default_batch', return_value=Batch()).start()
+        batch_patcher = patch('pyglet.graphics.get_default_batch', return_value=Batch())
+        self.addCleanup(batch_patcher.stop)
+        batch_patcher.start()
 
         self.program = ShaderProgram(mock_shader1, mock_shader2)
 
