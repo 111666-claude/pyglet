@@ -226,6 +226,54 @@ Once created, the window style cannot be altered::
 
     window = pyglet.window.Window(style=pyglet.window.Window.WINDOW_STYLE_DIALOG)
 
+Transparency and click-through
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Per-pixel transparent rendering and mouse click-through are **independent**
+states.  They can be selected in the constructor and toggled at runtime:
+
+* ``transparent=True`` requests an alpha-capable framebuffer and enables the
+  native compositing path.
+* ``mouse_passthrough=True`` (alias ``click_through``) makes the operating
+  system pass mouse input through the window to whatever is beneath it.
+* ``topmost=True`` keeps the window above other windows.
+
+The legacy styles keep their bundled meaning:
+
+* ``WINDOW_STYLE_TRANSPARENT`` = transparency on, input normal.
+* ``WINDOW_STYLE_OVERLAY`` = transparency + click-through + topmost.
+
+Explicit constructor arguments always override the style, so any combination
+is possible::
+
+    # Transparent overlay that still receives mouse events:
+    win = pyglet.window.Window(style="overlay", mouse_passthrough=False)
+
+    # Ordinary (opaque) click-through window:
+    win = pyglet.window.Window(mouse_passthrough=True)
+
+    # Runtime toggles:
+    win.set_mouse_passthrough(False)   # window accepts input again
+    win.transparent = False
+    win.set_topmost(True)
+
+The desired state survives fullscreen toggles and window recreation and is
+reset when the window is closed.  Unsupported combinations raise
+:class:`pyglet.window.WindowStateException` with an actionable message:
+
+* Enabling transparency at runtime on a window created without alpha bits
+  (check ``win.transparent_supported``) -- recreate it with
+  ``transparent=True`` or an ``alpha_size >= 8`` config.
+* Enabling mouse pass-through on an X11 display without the SHAPE extension.
+
+Platform native mechanisms are Win32
+(``WS_EX_LAYERED | WS_EX_TRANSPARENT`` + DWM blur-behind), macOS
+(``setOpaque:NO`` / ``setIgnoresMouseEvents:`` / window level) and X11
+(32-bit ARGB visual + the SHAPE input region + EWMH above state).  Repeatable
+per-platform acceptance steps live in ``WINDOW_STATE_ACCEPTANCE.md`` at the
+repository root, and the interactive/scripted harness is
+``examples/window/state_acceptance.py``.
+
 Caption
 ^^^^^^^
 

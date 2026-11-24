@@ -19,6 +19,7 @@ from pyglet.window import (
     _PlatformEventHandler,
     _ViewEventHandler,
 )
+from pyglet.window.state import RecordingNativeState
 
 # Platform event data is single item, so use platform event handler directly.
 HeadlessEventHandler = _PlatformEventHandler
@@ -28,6 +29,11 @@ ViewEventHandler = _ViewEventHandler
 class HeadlessWindow(BaseWindow):
     _egl_display_connection = None
     _egl_surface = None
+
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        # Records state transitions instead of calling any native platform.
+        self.native_state = RecordingNativeState()
+        super().__init__(*args, **kwargs)
 
     def _recreate(self, changes: Sequence[str]) -> None:
         pass
@@ -110,6 +116,11 @@ class HeadlessWindow(BaseWindow):
             self.context.attach(self.canvas)
 
             self.dispatch_event('_on_internal_resize', self._width, self._height)
+
+        # Headless has no native window; record the full initial state so
+        # tests can assert on transitions through the public API.
+        self._window_state.driver = self.native_state
+        self._window_state.realize()
 
 
 __all__ = ['HeadlessWindow']

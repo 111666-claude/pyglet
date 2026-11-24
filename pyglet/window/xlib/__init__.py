@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Sequence
 import pyglet
 from pyglet.display.xlib import XlibCanvas
 from pyglet.event import EventDispatcher
-from pyglet.libs.x11 import cursorfont, xlib
+from pyglet.libs.x11 import cursorfont, xlib, xshape
 from pyglet.util import asbytes
 from pyglet.window import (
     BaseWindow,
@@ -39,11 +39,13 @@ from pyglet.window import (
     MouseCursor,
     MouseCursorException,
     WindowException,
+    WindowStateException,
     _PlatformEventHandler,
     _ViewEventHandler,
     key,
     mouse,
 )
+from pyglet.window.state import StateCapabilities, X11NativeState
 
 if TYPE_CHECKING:
     from _ctypes import _Pointer
@@ -146,6 +148,12 @@ class XlibWindow(BaseWindow):
     _current_sync_value: xsync.XSyncValue | None = None
     _current_sync_valid: bool = False
 
+    # Injectable native-call seams for window state (click-through shape).
+    # Tests replace these on an instance/class with fakes.
+    _state_xlib = xlib
+    _state_xshape = xshape
+    _native_window_state: X11NativeState | None = None
+
     _default_event_mask: int = (0x1ffffff & ~xlib.PointerMotionHintMask
                                 & ~xlib.ResizeRedirectMask
                                 & ~xlib.SubstructureNotifyMask)
@@ -189,6 +197,9 @@ class XlibWindow(BaseWindow):
         if 'fullscreen' in changes or 'resizable' in changes:
             # clear out the GLX context
             self.context.detach()
+            # The native window (and its input shape) is going away; keep
+            # the desired state but force a full re-apply in _create().
+            self._window_state.invalidate()
             xlib.XDestroyWindow(self._x_display, self._window)
             del self.display._window_map[self._window]  # noqa: SLF001
             del self.display._window_map[self._view]  # noqa: SLF001
@@ -224,12 +235,24 @@ class XlibWindow(BaseWindow):
         self._x_display = self.display._display  # noqa: SLF001
         self._x_screen_id = self.display.x_screen
 
+        # Click-through depends on the X11 SHAPE extension.  Probe once and
+        # feed the result to the state controller so unsupported requests
+        # fail with a clear exception instead of no-op'ing silently.
+        shape_supported = xshape.shape_available(self._x_display)
+        self._window_state.capabilities = StateCapabilities(
+            alpha_framebuffer=self._window_state.capabilities.alpha_framebuffer,
+            mouse_passthrough=shape_supported,
+        )
+        if self._window_state.state.mouse_passthrough and not shape_supported:
+            msg = 'Mouse pass-through requires the X11 SHAPE extension, which is not available on this display.'
+            raise WindowStateException(msg)
+
         # Create X window if not already existing.
         if not self._window:
             root = xlib.XRootWindow(self._x_display, self._x_screen_id)
 
             visual_info = self.config.get_visual_info()
-            if self.style in ('transparent', 'overlay'):
+            if self.transparent:
                 xlib.XMatchVisualInfo(self._x_display, self._x_screen_id, 32, xlib.TrueColor, visual_info)
 
             visual = visual_info.visual
@@ -254,7 +277,7 @@ class XlibWindow(BaseWindow):
             self._dpi = self._screen.get_dpi()
             self._scale = self._screen.get_scale() if pyglet.options.dpi_scaling == "stretch" else 1.0
 
-            if self.style in ('transparent', 'overlay'):
+            if self.transparent:
                 mask |= xlib.CWBorderPixel
                 window_attributes.border_pixel = 0
                 window_attributes.background_pixel = 0
@@ -436,6 +459,20 @@ class XlibWindow(BaseWindow):
         self._applied_mouse_exclusive = None
         self._update_exclusivity()
 
+        # Attach the injectable native-state driver to the fresh X window(s)
+        # and apply the desired transparent/pass-through/topmost state.  This
+        # also runs after every fullscreen-driven recreation.  The same
+        # driver instance is reused and re-bound to the new XIDs.
+        if self._native_window_state is None:
+            self._native_window_state = X11NativeState(
+                self._state_xlib, self._state_xshape,
+                change_wm_state=self._update_wm_state_atom,
+            )
+        self._native_window_state.change_wm_state = self._update_wm_state_atom
+        self._native_window_state.attach(self._x_display, self._window, self._view)
+        self._window_state.driver = self._native_window_state
+        self._window_state.realize()
+
     def _map(self) -> None:
         if self._mapped:
             return
@@ -494,7 +531,13 @@ class XlibWindow(BaseWindow):
 
     def close(self) -> None:
         if not self._window:
+            # Still release app/context bookkeeping (mirrors the Win32 backend).
+            super().close()
             return
+
+        # Clear the input shape / EWMH state while the X window still exists,
+        # so no click-through/above state can outlive the window.
+        self._window_state.teardown()
 
         self.context.destroy()
         self._unmap()
@@ -517,6 +560,10 @@ class XlibWindow(BaseWindow):
     def switch_to(self) -> None:
         if self.context:
             self.context.set_current()
+
+    def _set_mouse_passthrough(self, state: bool) -> None:
+        """Backwards-compatible alias; use :meth:`set_mouse_passthrough`."""
+        self.set_mouse_passthrough(state)
 
     def flip(self):
         self.draw_mouse_cursor()
@@ -955,6 +1002,28 @@ class XlibWindow(BaseWindow):
             net_wm_state = xlib.XInternAtom(self._x_display, asbytes('_NET_WM_STATE'), False)
             if net_wm_state:
                 xlib.XDeleteProperty(self._x_display, self._window, net_wm_state)
+
+    def _update_wm_state_atom(self, atom_name: str, add: bool) -> None:
+        """Add (``add=True``, EWMH action 1) or remove (action 0) a
+        ``_NET_WM_STATE`` atom such as ``_NET_WM_STATE_ABOVE``.
+
+        Unlike :meth:`_set_wm_state`, this sends a standard client message
+        asking the window manager to update the property itself, so removing
+        one state never deletes unrelated states (e.g. fullscreen).
+        """
+        net_wm_state = xlib.XInternAtom(self._x_display, asbytes('_NET_WM_STATE'), False)
+        atom = xlib.XInternAtom(self._x_display, asbytes(atom_name), False)
+
+        event = xlib.XEvent()
+        event.xclient.type = xlib.ClientMessage
+        event.xclient.message_type = net_wm_state
+        event.xclient.display = cast(self._x_display, POINTER(xlib.Display))
+        event.xclient.window = self._window
+        event.xclient.format = 32
+        event.xclient.data.l[0] = 1 if add else 0  # _NET_WM_STATE_ADD / REMOVE
+        event.xclient.data.l[1] = atom
+        xlib.XSendEvent(self._x_display, self._get_root(),
+                        False, xlib.SubstructureRedirectMask, byref(event))
 
     def _set_wm_state(self, *states: str) -> None:
         # Set property

@@ -8,6 +8,7 @@ from pyglet.display.cocoa import CocoaCanvas
 from pyglet.event import EventDispatcher
 from pyglet.libs.darwin import AutoReleasePool, CGPoint, cocoapy
 from pyglet.window import BaseWindow, DefaultMouseCursor, MouseCursor
+from pyglet.window.state import CocoaNativeState
 
 from ...libs import darwin
 from .pyglet_delegate import PygletDelegate
@@ -70,9 +71,22 @@ class CocoaWindow(BaseWindow):
                                       cocoapy.NSClosableWindowMask |
                                       cocoapy.NSUtilityWindowMask,
         BaseWindow.WINDOW_STYLE_BORDERLESS: cocoapy.NSBorderlessWindowMask,
+        BaseWindow.WINDOW_STYLE_TRANSPARENT: cocoapy.NSTitledWindowMask |
+                                             cocoapy.NSClosableWindowMask |
+                                             cocoapy.NSMiniaturizableWindowMask,
+        BaseWindow.WINDOW_STYLE_OVERLAY: cocoapy.NSBorderlessWindowMask,
     }
 
     def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        # All AppKit interactions for the independently switchable state go
+        # through this injectable driver.  Colors are callables because
+        # NSColor must be resolved after the ObjC runtime is ready.
+        self._native_window_state = CocoaNativeState(
+            normal_level=cocoapy.NSNormalWindowLevel,
+            status_level=cocoapy.NSStatusWindowLevel,
+            clear_color=lambda: NSColor.clearColor(),
+            opaque_color=lambda: NSColor.windowBackgroundColor(),
+        )
         with AutoReleasePool():
             super().__init__(*args, **kwargs)
 
@@ -83,6 +97,9 @@ class CocoaWindow(BaseWindow):
         if 'fullscreen' in changes and not self._fullscreen:  # leaving fullscreen
             self.screen.release_display()
 
+        # The old NSWindow is released inside _create(); keep the desired
+        # state but force a full re-apply to the replacement NSWindow.
+        self._window_state.invalidate()
         self._create()
 
     def _create(self) -> None:
@@ -195,6 +212,14 @@ class CocoaWindow(BaseWindow):
             self.context.update_geometry()
             self.switch_to()
             self.set_vsync(self._vsync)
+
+            # Apply transparency / ignoresMouseEvents / window level before
+            # the window is shown to avoid an opaque flash.  Also runs after
+            # fullscreen recreation, so desired state is always restored.
+            self._native_window_state.attach(self._nswindow)
+            self._window_state.driver = self._native_window_state
+            self._window_state.realize()
+
             self.set_visible(self._visible)
 
     def _get_dpi_desc(self) -> int:
@@ -247,6 +272,10 @@ class CocoaWindow(BaseWindow):
             self.set_mouse_platform_visible(True)
             self.set_exclusive_mouse(False)
             self.set_exclusive_keyboard(False)
+
+            # Reset ignoresMouseEvents/opaque/level while the NSWindow is
+            # still alive, so no pass-through state can linger.
+            self._window_state.teardown()
 
             # Remove window from display and remove its view.
             self._nswindow.orderOut_(None)

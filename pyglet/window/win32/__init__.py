@@ -66,6 +66,7 @@ from pyglet.window import (
     key,
     mouse,
 )
+from pyglet.window.state import Win32NativeState
 
 # symbol,ctrl -> motion mapping
 _motion_map: dict[tuple[int, bool], int] = {
@@ -130,6 +131,10 @@ class Win32Window(BaseWindow):
 
     _ws_style: int = 0
     _ex_ws_style: int = 0
+    # Style-derived extended bits without the managed LAYERED/TRANSPARENT.
+    _base_ex_ws_style: int = 0
+    # Injectable native state driver; tests may replace the library seams.
+    _native_window_state: Win32NativeState | None = None
     _minimum_size: tuple[int, int] | None = None
     _maximum_size: tuple[int, int] | None = None
 
@@ -150,19 +155,44 @@ class Win32Window(BaseWindow):
         self._always_dwm = sys.getwindowsversion() >= (6, 2)
         self._interval = 0
 
+        # All native libraries are passed in here so tests can replace the
+        # driver's user32/dwmapi/gdi32 with fakes.
+        self._native_window_state = Win32NativeState(
+            _user32, _dwmapi, _gdi32, constants,
+            blurbehind_type=DWM_BLURBEHIND, byref=byref,
+            on_ex_style=self._on_native_ex_style,
+        )
+
         super().__init__(*args, **kwargs)
+
+    def _on_native_ex_style(self, ex_style: int) -> None:
+        """Keep the window's cached extended style aligned with the driver."""
+        self._ex_ws_style = ex_style
+
+    def _managed_ex_style(self, base_ex_style: int) -> int:
+        """Return ``base_ex_style`` plus the managed LAYERED/TRANSPARENT bits."""
+        state = self._window_state.state
+        ex_style = base_ex_style
+        if state.transparent or state.mouse_passthrough:
+            ex_style |= constants.WS_EX_LAYERED
+        if state.mouse_passthrough:
+            ex_style |= constants.WS_EX_TRANSPARENT
+        return ex_style
 
     def _recreate(self, changes: Sequence[str]) -> None:
         if 'context' in changes:
             self._wgl_context = None
 
+        # The same HWND is reconfigured in _create; force the state driver
+        # to re-apply every aspect via realize() afterwards.
+        self._window_state.invalidate()
         self._create()
 
     def _create(self) -> None:
         # Ensure style is set before determining width/height.
         if self._fullscreen:
             self._ws_style = constants.WS_POPUP
-            self._ex_ws_style = 0  # WS_EX_TOPMOST
+            base_ex_style = 0  # WS_EX_TOPMOST is applied via SetWindowPos
         else:
             styles = {
                 self.WINDOW_STYLE_DEFAULT: (constants.WS_OVERLAPPEDWINDOW, 0),
@@ -171,10 +201,16 @@ class Win32Window(BaseWindow):
                 self.WINDOW_STYLE_TOOL: (constants.WS_OVERLAPPED | constants.WS_CAPTION | constants.WS_SYSMENU,
                                          constants.WS_EX_TOOLWINDOW),
                 self.WINDOW_STYLE_BORDERLESS: (constants.WS_POPUP, 0),
+                # LAYERED / TRANSPARENT extended bits are managed by the
+                # WindowStateController + Win32NativeState so transparency
+                # and click-through can be toggled independently.
                 self.WINDOW_STYLE_TRANSPARENT: (constants.WS_OVERLAPPEDWINDOW, 0),
-                self.WINDOW_STYLE_OVERLAY: (constants.WS_POPUP, constants.WS_EX_TRANSPARENT),
+                self.WINDOW_STYLE_OVERLAY: (constants.WS_POPUP, 0),
             }
-            self._ws_style, self._ex_ws_style = styles[self._style]
+            self._ws_style, base_ex_style = styles[self._style]
+
+        self._base_ex_ws_style = base_ex_style
+        self._ex_ws_style = self._managed_ex_style(base_ex_style)
 
         if self._resizable and not self._fullscreen:
             self._ws_style |= constants.WS_THICKFRAME
@@ -293,19 +329,25 @@ class Win32Window(BaseWindow):
 
         # Position and size window
         if self._fullscreen:
-            hwnd_after = constants.HWND_TOPMOST if self.style == 'overlay' else constants.HWND_NOTOPMOST
+            hwnd_after = constants.HWND_TOPMOST if self.topmost else constants.HWND_NOTOPMOST
             _user32.SetWindowPos(self._hwnd, hwnd_after,
                                  self._screen.x, self._screen.y, width, height, constants.SWP_FRAMECHANGED)
-        elif self.style == 'transparent' or self.style == 'overlay':
-            self._set_transparency()
-            if self.style == 'overlay':
-                _user32.SetWindowPos(self._hwnd, constants.HWND_TOPMOST, 0,
-                                     0, width, height, constants.SWP_NOMOVE | constants.SWP_NOSIZE)
+        elif self.topmost:
+            _user32.SetWindowPos(self._hwnd, constants.HWND_TOPMOST, 0,
+                                 0, width, height, constants.SWP_NOMOVE | constants.SWP_NOSIZE)
         else:
             _user32.SetWindowPos(self._hwnd, constants.HWND_NOTOPMOST,
                                  0, 0, width, height, constants.SWP_NOMOVE | constants.SWP_FRAMECHANGED)
 
         self._update_view_location(self._width, self._height)
+
+        # Bind the native-state driver to the (possibly new) HWNDs and push
+        # the full desired state.  Idempotent; also runs after recreation.
+        self._native_window_state.attach(
+            self._hwnd, self._view_hwnd, self._base_ex_ws_style,
+        )
+        self._window_state.driver = self._native_window_state
+        self._window_state.realize()
 
         # Context must be created after window is created.
         if not self._wgl_context:
@@ -339,6 +381,9 @@ class Win32Window(BaseWindow):
             return
 
         self.set_mouse_platform_visible(True)
+
+        # Clear layered/transparent/topmost state while the HWND is valid.
+        self._window_state.teardown()
 
         _user32.DestroyWindow(self._hwnd)
         _user32.UnregisterClassW(self._view_window_class.lpszClassName, 0)

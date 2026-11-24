@@ -276,6 +276,11 @@ NSClosableWindowMask		= 1 << 1
 NSMiniaturizableWindowMask	= 1 << 2
 NSResizableWindowMask		= 1 << 3
 
+# NSWindow levels (CGWindowLevelKey values, see NSWindow.h)
+NSNormalWindowLevel            = 0
+NSFloatingWindowLevel          = 3
+NSStatusWindowLevel            = 25
+
 # /System/Library/Frameworks/AppKit.framework/Headers/NSPanel.h
 NSUtilityWindowMask		= 1 << 4
 

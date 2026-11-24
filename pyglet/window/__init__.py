@@ -101,6 +101,15 @@ from pyglet.event import EVENT_HANDLE_STATE, EventDispatcher
 from pyglet.graphics import shader
 from pyglet.math import Mat4
 from pyglet.window import event, key
+from pyglet.window.exceptions import WindowException, WindowStateException
+from pyglet.window.state import (
+    MOUSE_PASSTHROUGH,
+    TOPMOST,
+    TRANSPARENT,
+    StateCapabilities,
+    WindowState,
+    WindowStateController,
+)
 
 if TYPE_CHECKING:
     from pyglet.display.base import Display, Screen, ScreenMode
@@ -108,10 +117,6 @@ if TYPE_CHECKING:
     from pyglet.text import Label
 
 _is_pyglet_doc_run = hasattr(sys, 'is_pyglet_doc_run') and sys.is_pyglet_doc_run
-
-
-class WindowException(Exception):
-    """The root exception for all window-related errors."""
 
 
 class NoSuchDisplayException(WindowException):
@@ -446,7 +451,11 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
                  screen: Screen | None = None,
                  config: Config | None = None,
                  context: Context | None = None,
-                 mode: ScreenMode | None = None) -> None:
+                 mode: ScreenMode | None = None,
+                 transparent: bool | None = None,
+                 mouse_passthrough: bool | None = None,
+                 topmost: bool | None = None,
+                 click_through: bool | None = None) -> None:
         """Create a window.
 
         All parameters are optional, and reasonable defaults are assumed
@@ -499,6 +508,28 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
             mode:
                 The screen will be switched to this mode if `fullscreen` is
                 True.  If None, an appropriate mode is selected to accommodate ``width`` and ``height``.
+            transparent:
+                Enable per-pixel transparent rendering.  When None (the
+                default), transparency is inferred from ``style``: it is
+                enabled for ``WINDOW_STYLE_TRANSPARENT`` and
+                ``WINDOW_STYLE_OVERLAY`` and disabled otherwise.  Pass an
+                explicit True/False to decouple transparency from the style.
+                An alpha-capable framebuffer is requested automatically.
+            mouse_passthrough:
+                When True, mouse events pass through the window to whatever
+                is beneath it (also called click-through).  When None (the
+                default), it is enabled automatically for
+                ``WINDOW_STYLE_OVERLAY`` only.  Can be toggled later with
+                :py:meth:`set_mouse_passthrough`.  ``click_through`` is an
+                alias keyword/property.
+            topmost:
+                Keep the window above other windows.  When None (the
+                default), it is enabled automatically for
+                ``WINDOW_STYLE_OVERLAY``.  Can be toggled later with
+                :py:meth:`set_topmost`.
+            click_through:
+                Alias for ``mouse_passthrough``.  Ignored when
+                ``mouse_passthrough`` is supplied.
 
         """
         EventDispatcher.__init__(self)
@@ -510,8 +541,21 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
         if not screen:
             screen = display.get_default_screen()
 
+        # Resolve the independently switchable state.  Explicit constructor
+        # arguments take precedence; otherwise the legacy window styles keep
+        # their bundled meaning (transparent style = transparency only,
+        # overlay = transparency + pass-through + topmost).
+        if mouse_passthrough is None and click_through is not None:
+            mouse_passthrough = click_through
+        initial_state = self.resolve_window_state(
+            style, transparent, mouse_passthrough, topmost,
+        )
+        transparent = initial_state.transparent
+        mouse_passthrough = initial_state.mouse_passthrough
+        topmost = initial_state.topmost
+
         # Ensure the framebuffer is large enough to support transparency.
-        alpha_size = 8 if style in ('transparent', 'overlay') else None
+        alpha_size = 8 if transparent else None
 
         if not config:
             for template_config in [
@@ -527,7 +571,7 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
             if not config:
                 msg = 'No standard config is available.'
                 raise NoSuchConfigException(msg)
-        else:
+        elif transparent:
             # Override config setting if they are requesting transparency.
             config.alpha_size = alpha_size
 
@@ -547,6 +591,17 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
         else:
             self._screen = screen
         self._display = self._screen.display
+
+        # Single source of truth for the independently switchable window
+        # state.  The native driver is attached by the platform _create().
+        alpha_bits = getattr(self._config, 'alpha_size', 0) or 0
+        self._window_state = WindowStateController(
+            initial=initial_state,
+            capabilities=StateCapabilities(
+                alpha_framebuffer=alpha_bits > 0,
+                mouse_passthrough=True,
+            ),
+        )
 
         if fullscreen:
             if width is None and height is None:
@@ -664,6 +719,12 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
         if not self._context:
             return
         app.windows.remove(self)
+        # Safety net: platform close() methods normally tear state down before
+        # destroying the native handle; this makes sure any backend (and the
+        # headless/dummy backends) resets its native state exactly once.
+        window_state = getattr(self, '_window_state', None)
+        if window_state is not None:
+            window_state.teardown()
         self._context.destroy()
         self._config = None
         self._context = None
@@ -979,6 +1040,101 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
             height = self.screen.height
         return width, height
 
+    # Independent transparency / input / stacking state ------------------ #
+    @classmethod
+    def resolve_window_state(
+        cls,
+        style: str | None = None,
+        transparent: bool | None = None,
+        mouse_passthrough: bool | None = None,
+        topmost: bool | None = None,
+    ) -> WindowState:
+        """Resolve constructor arguments and legacy styles into a state.
+
+        Explicit True/False arguments always win over the style; unspecified
+        arguments (None) inherit the style's bundled behaviour.
+        """
+        if transparent is None:
+            transparent = style in (cls.WINDOW_STYLE_TRANSPARENT, cls.WINDOW_STYLE_OVERLAY)
+        if mouse_passthrough is None:
+            mouse_passthrough = style == cls.WINDOW_STYLE_OVERLAY
+        if topmost is None:
+            topmost = style == cls.WINDOW_STYLE_OVERLAY
+        return WindowState(
+            transparent=bool(transparent),
+            mouse_passthrough=bool(mouse_passthrough),
+            topmost=bool(topmost),
+        )
+
+    def set_transparent(self, transparent: bool = True) -> None:
+        """Enable or disable per-pixel transparent rendering.
+
+        Transparency and mouse pass-through are independent: a transparent
+        window normally still receives mouse events, and a pass-through
+        window does not have to be transparent.
+
+        Per-pixel transparency requires an alpha-capable framebuffer.  The
+        constructor requests one automatically when ``transparent=True``
+        (or when using the ``'transparent'`` / ``'overlay'`` styles).
+        Enabling transparency at runtime on a window created without alpha
+        bits raises :class:`~pyglet.window.WindowStateException`; recreate
+        the window with ``transparent=True`` in that case.
+
+        Native window state is re-applied automatically after fullscreen
+        toggles and window recreation, and reset when the window is closed.
+
+        Args:
+            transparent:
+                True to composite the window with per-pixel alpha, False to
+                return it to an opaque window.
+
+        .. versionadded:: 2.1.7
+        """
+        self._window_state.set(TRANSPARENT, transparent)
+
+    def set_mouse_passthrough(self, state: bool) -> None:
+        """Set whether the operating system ignores mouse input for this window.
+
+        When enabled, mouse events pass through the window to whatever is
+        beneath it (often called *click-through*).  This is typically used
+        for transparent overlays.  Disabling it makes the window accept
+        input and focus normally again.
+
+        The desired state survives fullscreen toggles and recreation.
+        Platform support details:
+
+        * Win32 uses ``WS_EX_TRANSPARENT | WS_EX_LAYERED``.
+        * macOS calls ``-[NSWindow setIgnoresMouseEvents:]``.
+        * X11 uses the SHAPE extension's input region; if the extension is
+          unavailable, :class:`~pyglet.window.WindowStateException` is raised.
+
+        Args:
+            state:
+                ``True`` to let mouse input pass through the window.
+
+        .. versionadded:: 2.1.8
+        """
+        self._window_state.set(MOUSE_PASSTHROUGH, state)
+
+    def set_click_through(self, enabled: bool = True) -> None:
+        """Alias for :meth:`set_mouse_passthrough` with a default of True."""
+        self.set_mouse_passthrough(enabled)
+
+    def set_topmost(self, topmost: bool = True) -> None:
+        """Enable or disable always-on-top behaviour for the window.
+
+        This is exposed separately because the legacy
+        ``WINDOW_STYLE_OVERLAY`` bundles topmost behaviour together with
+        transparency and click-through.
+
+        Args:
+            topmost:
+                True to keep the window above non-topmost windows.
+
+        .. versionadded:: 2.1.7
+        """
+        self._window_state.set(TOPMOST, topmost)
+
     def set_minimum_size(self, width: int, height: int) -> None:
         """Set the minimum size of the window.
 
@@ -1185,6 +1341,53 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
     def style(self) -> str:
         """The window style; one of the ``WINDOW_STYLE_*`` constants. Read-only."""
         return self._style
+
+    @property
+    def transparent(self) -> bool:
+        """True when per-pixel transparent rendering is requested.
+
+        Use :meth:`set_transparent` to change this at runtime.
+        """
+        return self._window_state.get(TRANSPARENT)
+
+    @transparent.setter
+    def transparent(self, value: bool) -> None:
+        self.set_transparent(value)
+
+    @property
+    def transparent_supported(self) -> bool:
+        """True if the framebuffer has alpha bits for per-pixel transparency."""
+        return self._window_state.capabilities.alpha_framebuffer
+
+    @property
+    def mouse_passthrough(self) -> bool:
+        """True when mouse input passes through the window.
+
+        Use :meth:`set_mouse_passthrough` to change this at runtime.
+        """
+        return self._window_state.get(MOUSE_PASSTHROUGH)
+
+    @mouse_passthrough.setter
+    def mouse_passthrough(self, value: bool) -> None:
+        self.set_mouse_passthrough(value)
+
+    @property
+    def click_through(self) -> bool:
+        """Alias for :attr:`mouse_passthrough`."""
+        return self.mouse_passthrough
+
+    @click_through.setter
+    def click_through(self, value: bool) -> None:
+        self.set_mouse_passthrough(value)
+
+    @property
+    def topmost(self) -> bool:
+        """True when the window is kept above other windows."""
+        return self._window_state.get(TOPMOST)
+
+    @topmost.setter
+    def topmost(self, value: bool) -> None:
+        self.set_topmost(value)
 
     @property
     def fullscreen(self) -> bool:
@@ -1881,9 +2084,13 @@ __all__ = (
     "FPSDisplay",
     # errors
     "WindowException",
+    "WindowStateException",
     "NoSuchScreenModeException",
     "NoSuchDisplayException",
     "NoSuchConfigException",
     "MouseCursorException",
-
+    # window state helpers
+    "WindowState",
+    "WindowStateController",
+    "StateCapabilities",
 )

@@ -407,6 +407,60 @@ XSyncGetPriority.restype = c_int
 XSyncGetPriority.argtypes = [POINTER(Display), XID, POINTER(c_int)]
 
 
+# ---------------------------------------------------------------------------
+# X11 SHAPE extension (lives in libXext, the same library as XSync)
+# ---------------------------------------------------------------------------
+
+# Shape kind
+ShapeBounding = 0
+ShapeClip = 1
+ShapeInput = 2
+
+# Shape operation
+ShapeSet = 0
+ShapeUnion = 1
+ShapeIntersect = 2
+ShapeSubtract = 3
+ShapeInvert = 4
+
+XShapeCombineRegion = _lib.XShapeCombineRegion
+XShapeCombineRegion.argtypes = [
+    POINTER(Display),
+    c_void_p,
+    c_int,  # shape_kind (e.g. ShapeInput)
+    c_int, c_int,  # x, y offset
+    c_void_p,  # region
+    c_int,  # ShapeOp
+]
+XShapeCombineRegion.restype = None
+
+XShapeCombineMask = _lib.XShapeCombineMask
+XShapeCombineMask.argtypes = [
+    Display,  # display
+    c_void_p,  # destination window
+    c_int,  # shape_kind (e.g. ShapeInput)
+    c_int, c_int,  # x, y offset
+    c_ulong,  # Pixmap (0 == None)
+    c_int,  # ShapeOp (e.g. ShapeSet)
+]
+XShapeCombineMask.restype = None
+
+XShapeQueryExtension = _lib.XShapeQueryExtension
+XShapeQueryExtension.argtypes = [
+    POINTER(Display), POINTER(c_int), POINTER(c_int),
+]
+XShapeQueryExtension.restype = c_int
+
+
+def has_shape_support(display) -> bool:
+    """Return True if the SHAPE extension is available on ``display``."""
+    event_base = c_int()
+    error_base = c_int()
+    return bool(XShapeQueryExtension(
+        display, byref(event_base), byref(error_base),
+    ))
+
+
 __all__ = ['SYNC_MAJOR_VERSION', 'SYNC_MINOR_VERSION', 'X_SyncInitialize',
 'X_SyncListSystemCounters', 'X_SyncCreateCounter', 'X_SyncSetCounter',
 'X_SyncChangeCounter', 'X_SyncQueryCounter', 'X_SyncDestroyCounter',
