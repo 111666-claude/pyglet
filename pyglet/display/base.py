@@ -6,6 +6,12 @@ from pyglet import gl
 from pyglet import app
 from pyglet import window
 from pyglet import display
+from pyglet.display.identity import (
+    UNKNOWN_MONITOR_NAME,
+    ScreenRegistry,
+    build_identity,
+    fallback_screen_info,
+)
 
 if TYPE_CHECKING:
     from pyglet.gl import Config
@@ -21,30 +27,35 @@ class Display:
     x_screen: int = None
     """The X11 screen number of this display, if applicable."""
 
+    #: Backend name used to namespace stable screen identity keys.
+    _backend: str = "generic"
+
     def __init__(self, name: str = None, x_screen: int = None) -> None:
         """Create a display connection for the given name and screen.
 
         On X11, :attr:`name` is of the form ``"hostname:display"``, where the
-        default is usually ``":1"``.  On X11, :attr:`x_screen` gives the X 
-        screen number to use with this display.  A pyglet display can only be 
+        default is usually ``":1"``.  On X11, :attr:`x_screen` gives the X
+        screen number to use with this display.  A pyglet display can only be
         used with one X screen; open multiple display connections to access
-        multiple X screens.  
-        
+        multiple X screens.
+
         Note that TwinView, Xinerama, xrandr and other extensions present
         multiple monitors on a single X screen; this is usually the preferred
         mechanism for working with multiple monitors under X11 and allows each
         screen to be accessed through a single pyglet`~pyglet.display.Display`
 
-        On platforms other than X11, :attr:`name` and :attr:`x_screen` are 
+        On platforms other than X11, :attr:`name` and :attr:`x_screen` are
         ignored; there is only a single display device on these systems.
         """
         display._displays.add(self)
+        #: Tracks stable screen identity across enumerations/hotplug.
+        self.screen_registry = ScreenRegistry(backend=self._backend)
 
     def get_screens(self) -> list[Screen]:
         """Get the available screens.
 
         A typical multi-monitor workstation comprises one :class:`Display`
-        with multiple :class:`Screen` s.  This method returns a list of 
+        with multiple :class:`Screen` s.  This method returns a list of
         screens which can be enumerated to select one for full-screen display.
 
         For the purposes of creating an OpenGL config, the default screen
@@ -54,17 +65,63 @@ class Display:
         """
         raise NotImplementedError('abstract')
 
-    def get_default_screen(self) -> Screen:
+    def refresh_screens(self) -> list[Screen]:
+        """Re-enumerate the screens, picking up hotplug/unplug changes.
+
+        Backends that cache :meth:`get_screens` results drop their cache and
+        query the operating system again.  The display's
+        :attr:`screen_registry` reconciles the new snapshot so stable screen
+        keys survive disconnect/reconnect.
+
+        .. versionadded:: 2.1
+        """
+        return self.get_screens()
+
+    def get_default_screen(self) -> Screen | None:
         """Get the default (primary) screen as specified by the user's operating system
         preferences.
+
+        When the native API flags a primary screen it is returned; otherwise
+        the historical heuristic of the screen whose top-left corner is
+        ``(0, 0)`` is used, falling back to the first enumerated screen.
+
+        Returns ``None`` if the display currently reports no screens
+        (for example all monitors were unplugged).  Window creation requires
+        a screen, so callers that may run into an empty display list should
+        handle this case explicitly.
         """
         screens = self.get_screens()
+        if not screens:
+            return None
+
+        for screen in screens:
+            if getattr(screen, "is_primary", False):
+                return screen
+
         for screen in screens:
             if screen.x == 0 and screen.y == 0:
                 return screen
 
         # No Primary screen found?
         return screens[0]
+
+    def get_screen_by_stable_id(self, stable_id: str) -> Screen | None:
+        """Find a currently connected screen from a saved :attr:`Screen.stable_id`.
+
+        Use this to restore the monitor the user selected in a previous
+        session.  Returns ``None`` when the id is unknown or the matching
+        screen is currently disconnected; callers should then fall back to
+        :meth:`get_default_screen`.
+
+        .. versionadded:: 2.1
+        """
+        identity = self.screen_registry.resolve(stable_id)
+        if identity is None:
+            return None
+        for screen in self.get_screens():
+            if screen.stable_id == identity.key:
+                return screen
+        return None
 
     def get_windows(self) -> list[BaseWindow]:
         """Get the windows currently attached to this display."""
@@ -87,9 +144,18 @@ class Screen:
     
     Use :func:`~Display.get_screens` or :func:`~Display.get_default_screen`
     to obtain an instance of this class.
+
+    Stable identity, the primary flag and the current refresh rate are
+    available through :attr:`stable_id`, :attr:`name`,
+    :attr:`is_primary` and :attr:`refresh_rate` (and the
+    :meth:`get_display_id` / :meth:`get_monitor_name` accessors).  These are
+    populated by the backend; missing native values fall back to a
+    deterministic geometry based identity, the name
+    ``"Unknown"`` and ``None`` for the refresh rate.
     """
 
-    def __init__(self, display: Display, x: int, y: int, width: int, height: int):
+    def __init__(self, display: Display, x: int, y: int, width: int, height: int,
+                 *, identity=None):
         self.display = display
         """Display this screen belongs to."""
         self.x = x
@@ -101,8 +167,112 @@ class Screen:
         self.height = height
         """Height of the screen, in pixels."""
 
+        if identity is None:
+            backend = getattr(display, "_backend", "generic")
+            info = fallback_screen_info(
+                x=x, y=y, width=width, height=height, backend=backend,
+            )
+            identity = build_identity(info)
+        self.identity = identity
+        """The :class:`~pyglet.display.identity.ScreenIdentity` for this screen."""
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(x={self.x}, y={self.y}, width={self.width}, height={self.height})"
+
+    # -- identity / primary / refresh rate ---------------------------------
+
+    @property
+    def stable_id(self) -> str:
+        """A saveable identity key that survives disconnect/reconnect.
+
+        Save this value in user configuration and pass it to
+        :meth:`Display.get_screen_by_stable_id` on the next launch.  The key
+        is derived from the strongest identifier the backend offers; see
+        :mod:`pyglet.display.identity` for the full policy.
+        """
+        return self.identity.key
+
+    #: Alias of :attr:`stable_id`.
+    @property
+    def unique_id(self) -> str:
+        return self.identity.key
+
+    @property
+    def display_id(self):
+        """Native identifier of the screen (backend specific).
+
+        X11/RandR: the output XID (int); Cocoa: the ``CGDirectDisplayID``;
+        Win32: the ``HMONITOR`` handle.  May be a deterministic fallback
+        string/hash when the platform exposes no usable identifier.
+        """
+        native_id = self.identity.native_id
+        if native_id is not None:
+            return native_id
+        return self.stable_id
+
+    @property
+    def id(self):
+        """Alias of :attr:`display_id`."""
+        return self.display_id
+
+    def get_display_id(self):
+        """Get the native unique identifier for the screen.
+
+        Mirrors the upstream pyglet 2.1.8+ accessor; prefer
+        :attr:`display_id` / :attr:`stable_id` for new code.
+        """
+        return self.display_id
+
+    @property
+    def name(self) -> str:
+        """Raw monitor/friendly/connector name, or ``"Unknown"``.
+
+        This value is not guaranteed to be unique when two identical monitors
+        are attached; use :attr:`label` or :attr:`stable_id` to disambiguate.
+        """
+        return self.identity.name or UNKNOWN_MONITOR_NAME
+
+    @property
+    def monitor_name(self) -> str:
+        """Alias of :attr:`name`."""
+        return self.name
+
+    def get_monitor_name(self) -> str:
+        """Get the friendly/connector name of the screen.
+
+        If no name can be queried, :data:`~pyglet.display.identity.UNKNOWN_MONITOR_NAME`
+        (``"Unknown"``) is returned.  Mirrors the upstream pyglet 2.1.8+
+        accessor.
+        """
+        return self.name
+
+    @property
+    def label(self) -> str:
+        """Unique human-readable label; duplicate names gain a ``#2`` suffix."""
+        return self.identity.label
+
+    @property
+    def is_primary(self) -> bool:
+        """Whether this is the operating system's primary screen.
+
+        When the backend cannot query the flag directly, it falls back to
+        the screen whose top-left corner is ``(0, 0)``.
+        """
+        return bool(self.identity.is_primary)
+
+    @property
+    def refresh_rate(self) -> float | None:
+        """Current vertical refresh rate in Hertz, or ``None`` if unknown.
+
+        Always expressed in Hz; backend specific unit conversions and
+        invalid sentinel values are handled during enumeration.
+        """
+        return self.identity.refresh_rate
+
+    def get_refresh_rate(self) -> float | None:
+        """Return :attr:`refresh_rate` (current refresh rate in Hz)."""
+        return self.refresh_rate
+
 
     def get_best_config(self, template: Config = None) -> Config:
         """Get the best available GL config.
@@ -239,7 +409,7 @@ class ScreenMode:
     Applications should not construct `ScreenMode` instances themselves; see
     :meth:`Screen.get_modes`.
 
-    The :attr:`depth` and :attr:`rate` variables may be ``None`` if the 
+    The :attr:`depth` and :attr:`rate` variables may be ``None`` if the
     operating system does not provide relevant data.
 
     .. versionadded:: 1.2
@@ -254,8 +424,8 @@ class ScreenMode:
     depth: int = None
     """Pixel color depth, in bits per pixel."""
 
-    rate: int = None
-    """Screen refresh rate in Hz."""
+    rate: int | float | None = None
+    """Screen refresh rate in Hz; may be fractional or ``None`` if unknown."""
 
     def __init__(self, screen: Screen) -> None:
         self.screen = screen

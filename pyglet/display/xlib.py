@@ -9,6 +9,11 @@ from pyglet import app
 from pyglet.app.xlib import XlibSelectDevice
 
 from ..libs.x11.xlib import Window
+from .identity import (
+    fallback_screen_info,
+    refresh_rate_from_xf86vm,
+    xrandr_screen_info,
+)
 from . import xlib_vidmoderestore
 from .base import Canvas, Display, Screen, ScreenMode
 
@@ -41,6 +46,67 @@ try:
     _have_xf86vmode = True
 except:
     _have_xf86vmode = False
+
+try:
+    from pyglet.libs.x11 import xrandr
+
+    _have_xrandr = True
+except:
+    _have_xrandr = False
+
+
+def pair_infos_to_screens(screens, infos):
+    """Pair normalized RandR ``infos`` with pyglet ``screens``.
+
+    The historical Xinerama/XScreen enumeration remains the source of the
+    actual :class:`XlibScreen` objects and geometry; this helper only attaches
+    richer native metadata.  Exact geometry matches are consumed first; when
+    counts match but geometry differs, enumeration order is used.  Screens
+    left without a native record get a geometry based fallback
+    :class:`~pyglet.display.identity.ScreenInfo`.
+
+    This function is pure so the pairing contract can be tested with fakes.
+    """
+    result = [None] * len(screens)
+    remaining = dict(enumerate(infos))
+
+    def geometry(screen):
+        return screen.x, screen.y, screen.width, screen.height
+
+    # First pass: exact geometry.
+    for i, screen in enumerate(screens):
+        target = geometry(screen)
+        for j, info in list(remaining.items()):
+            if (info.x, info.y, info.width, info.height) == target:
+                result[i] = info
+                del remaining[j]
+                break
+
+    # Second pass: same resolution regardless of origin.
+    for i, screen in enumerate(screens):
+        if result[i] is not None:
+            continue
+        target = (screen.width, screen.height)
+        for j, info in list(remaining.items()):
+            if (info.width, info.height) == target:
+                result[i] = info
+                del remaining[j]
+                break
+
+    # Third pass: preserve enumeration order when counts line up.
+    if remaining and all(item is None for item in result):
+        ordered = list(infos)
+        if len(ordered) == len(screens):
+            return list(ordered)
+
+    # Fill any gaps with deterministic geometry fallbacks.
+    for i, screen in enumerate(screens):
+        if result[i] is None:
+            result[i] = fallback_screen_info(
+                x=screen.x, y=screen.y, width=screen.width, height=screen.height,
+                ordinal=i, backend="x11",
+            )
+    return result
 
 
 # Set up error handler
@@ -75,6 +141,7 @@ xlib.XSetErrorHandler(_error_handler_ptr)
 
 class XlibDisplay(XlibSelectDevice, Display):
     _display = None  # POINTER(xlib.Display)
+    _backend = "x11"
 
     _x_im = None  # X input method
     # TODO close _x_im when display connection closed.
@@ -147,7 +214,129 @@ class XlibDisplay(XlibSelectDevice, Display):
                                 screen_info.contents.height,
                                 False)
             self._screens = [screen]
+
+        self._attach_screen_identities()
         return self._screens
+
+    def refresh_screens(self):
+        """Drop the cached screen list and re-enumerate (hotplug support)."""
+        self._screens = None
+        return self.get_screens()
+
+    def _attach_screen_identities(self):
+        """Query RandR (if available) and bind stable identities to screens."""
+        randr_infos = []
+        if _have_xrandr:
+            try:
+                randr_infos = self._query_randr_screen_infos()
+            except Exception:
+                # Native RandR data is enrichment only; never break screen
+                # enumeration because of a driver/binding quirk.
+                if __import__("pyglet").options.get("debug_x11"):
+                    import traceback
+                    traceback.print_exc()
+                randr_infos = []
+
+        paired = pair_infos_to_screens(self._screens, randr_infos)
+        self._fill_refresh_rates_from_xf86(paired)
+        identities = self.screen_registry.synchronize(paired)
+        for screen, identity in zip(self._screens, identities):
+            screen.identity = identity
+
+    def _fill_refresh_rates_from_xf86(self, paired):
+        """Fill missing rates from XF86VidMode when RandR omitted one.
+
+        XF86VidMode mode lines are not screen specific while Xinerama is
+        active, so only use this fallback for the non-Xinerama screen.
+        All values are already normalized to Hz by ``XlibScreenMode``.
+        """
+        if not _have_xf86vmode:
+            return
+        for screen, info in zip(self._screens, paired):
+            if info.refresh_rate is not None or getattr(screen, "_xinerama", False):
+                continue
+            try:
+                mode = screen.get_mode()
+            except Exception:
+                mode = None
+            rate = getattr(mode, "rate", None)
+            if rate is not None:
+                info.refresh_rate = rate
+
+    def _query_randr_screen_infos(self):
+        """Extract active RandR outputs as normalized ScreenInfo records."""
+        root = xlib.XDefaultRootWindow(self._display)
+        res_ptr = xrandr.XRRGetScreenResourcesCurrent(self._display, root)
+        if not res_ptr:
+            res_ptr = xrandr.XRRGetScreenResources(self._display, root)
+        if not res_ptr:
+            return []
+
+        try:
+            primary_output = xrandr.XRRGetOutputPrimary(self._display, root)
+            res = res_ptr.contents
+
+            mode_by_id = {}
+            for mode in res.modes[:res.nmode]:
+                mode_by_id[mode.id] = mode
+
+            infos = []
+            ordinal = 0
+            for index in range(res.noutput):
+                output_id = res.outputs[index]
+                output_info_ptr = xrandr.XRRGetOutputInfo(
+                    self._display, res_ptr, output_id,
+                )
+                if not output_info_ptr:
+                    continue
+                try:
+                    output_info = output_info_ptr.contents
+                    name = None
+                    if output_info.name and output_info.nameLen > 0:
+                        name = ctypes.string_at(
+                            output_info.name, output_info.nameLen,
+                        ).decode("utf-8", "replace")
+
+                    dot_clock = h_total = v_total = None
+                    x = y = 0
+                    width = height = 0
+                    if output_info.crtc:
+                        crtc_info_ptr = xrandr.XRRGetCrtcInfo(
+                            self._display, res_ptr, output_info.crtc,
+                        )
+                        if crtc_info_ptr:
+                            try:
+                                crtc_info = crtc_info_ptr.contents
+                                x, y = crtc_info.x, crtc_info.y
+                                width, height = crtc_info.width, crtc_info.height
+                                mode = mode_by_id.get(crtc_info.mode)
+                                if mode is not None:
+                                    dot_clock = mode.dotClock
+                                    h_total = mode.hTotal
+                                    v_total = mode.vTotal
+                            finally:
+                                xrandr.XRRFreeCrtcInfo(crtc_info_ptr)
+
+                    info = xrandr_screen_info(
+                        output_id=output_id,
+                        name=name,
+                        connected=output_info.connection == xrandr.RR_CONNECTED,
+                        crtc_id=output_info.crtc,
+                        x=x, y=y, width=width, height=height,
+                        primary_output_id=primary_output,
+                        dot_clock_hz=dot_clock,
+                        h_total=h_total,
+                        v_total=v_total,
+                        ordinal=ordinal,
+                    )
+                    if info is not None:
+                        infos.append(info)
+                        ordinal += 1
+                finally:
+                    xrandr.XRRFreeOutputInfo(output_info_ptr)
+            return infos
+        finally:
+            xrandr.XRRFreeScreenResources(res_ptr)
 
     # XlibSelectDevice interface
 
@@ -276,7 +465,11 @@ class XlibScreenMode(ScreenMode):
         self.info = info
         self.width = info.hdisplay
         self.height = info.vdisplay
-        self.rate = (info.dotclock * 1000) / (info.htotal * info.vtotal)
+        # XF86VidMode dotclock is measured in kHz (unlike RandR's Hz).
+        # Invalid/zero timings produce None rather than a division error.
+        self.rate = refresh_rate_from_xf86vm(
+            info.dotclock, info.htotal, info.vtotal,
+        )
         self.depth = None
 
 

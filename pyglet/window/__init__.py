@@ -509,6 +509,10 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
         if not screen:
             screen = display.get_default_screen()
 
+        if screen is None:
+            msg = "The display has no available screens (all monitors may be disconnected)."
+            raise NoSuchDisplayException(msg)
+
         if not config:
             for template_config in [gl.Config(double_buffer=True, depth_size=24, major_version=3, minor_version=3),
                                     gl.Config(double_buffer=True, depth_size=16, major_version=3, minor_version=3),

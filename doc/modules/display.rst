@@ -16,3 +16,11 @@ pyglet.display
 .. autoclass:: Canvas
   :members:
   :undoc-members:
+
+Screen identity and refresh rates
+---------------------------------
+
+.. automodule:: pyglet.display.identity
+  :members:
+  :undoc-members:
+

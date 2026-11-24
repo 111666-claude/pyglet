@@ -110,6 +110,56 @@ The previous window size and location, if any, will attempt to be restored,
 however the operating system does not always permit this, and the window may
 have relocated.
 
+Screen identity, primary monitor and refresh rate
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Besides geometry, each :py:class:`~pyglet.display.Screen` exposes a stable
+identity, the operating-system primary flag and the current refresh rate:
+
+* :py:attr:`~pyglet.display.Screen.stable_id` is a saveable string key that
+  survives disconnect/reconnect of the same monitor.
+* :py:attr:`~pyglet.display.Screen.display_id` (also
+  :py:meth:`~pyglet.display.Screen.get_display_id`) is the native identifier
+  (an X11 RandR output XID, a Win32 ``HMONITOR`` or a Cocoa
+  ``CGDirectDisplayID``).
+* :py:attr:`~pyglet.display.Screen.name` /
+  :py:meth:`~pyglet.display.Screen.get_monitor_name` give the raw monitor,
+  friendly or connector name (``"Unknown"`` when unavailable).  Names are not
+  guaranteed to be unique; :py:attr:`~pyglet.display.Screen.label` adds a
+  stable ``#2`` suffix for duplicate names.
+* :py:attr:`~pyglet.display.Screen.is_primary` marks the primary monitor.
+* :py:attr:`~pyglet.display.Screen.refresh_rate` /
+  :py:meth:`~pyglet.display.Screen.get_refresh_rate` give the current rate in
+  Hertz, or ``None`` when the platform does not provide a valid value.
+
+To remember the monitor the player selected, save ``stable_id`` and resolve it
+on the next launch, falling back to the default screen when it is missing or
+unplugged::
+
+    display = pyglet.display.get_display()
+
+    # Save:
+    chosen_id = window.screen.stable_id
+    config_file["screen"] = chosen_id
+
+    # Restore:
+    screen = display.get_screen_by_stable_id(config_file.get("screen"))
+    if screen is None:
+        screen = display.get_default_screen()
+
+The identity policy prefers, strongest first: hardware (EDID) identity, a
+stable output/device name (RandR connector such as ``DP-1`` or the Win32
+device name), the native identifier, an unambiguous name+resolution
+fingerprint, and finally a deterministic geometry fallback.  Two identical
+same-name monitors are never silently merged; when they are
+indistinguishable the registry avoids guessing.  Call
+:py:meth:`~pyglet.display.Display.refresh_screens` to re-enumerate after a
+hotplug event; the display's ``screen_registry`` reconciles the new snapshot
+against previous identities.
+
+``Display.get_default_screen`` returns ``None`` if the display currently
+reports no screens.
+
 Size and position
 ^^^^^^^^^^^^^^^^^
 

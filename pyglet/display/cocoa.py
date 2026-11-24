@@ -4,6 +4,7 @@ from __future__ import annotations
 from ctypes import c_uint32, c_void_p, byref
 
 from .base import Canvas, Display, Screen, ScreenMode
+from .identity import cocoa_screen_info, refresh_rate_from_cocoa
 from pyglet.libs.darwin.cocoapy import CGDirectDisplayID, quartz, cf, ObjCClass, get_NSString
 from pyglet.libs.darwin.cocoapy import cfstring_to_string, cfarray_to_list
 from pyglet.libs.darwin import NSDeviceResolution
@@ -13,29 +14,79 @@ NSScreen = ObjCClass('NSScreen')
 
 
 class CocoaDisplay(Display):
+    _backend = "cocoa"
 
     def get_screens(self):
         maxDisplays = 256
         activeDisplays = (CGDirectDisplayID * maxDisplays)()
         count = c_uint32()
         quartz.CGGetActiveDisplayList(maxDisplays, activeDisplays, byref(count))
-        return [CocoaScreen(self, displayID) for displayID in list(activeDisplays)[:count.value]]
+        display_ids = list(activeDisplays)[:count.value]
+        screens = [CocoaScreen(self, displayID) for displayID in display_ids]
+
+        main_id = quartz.CGMainDisplayID()
+        infos = []
+        for ordinal, (displayID, screen) in enumerate(zip(display_ids, screens)):
+            infos.append(cocoa_screen_info(
+                display_id=displayID,
+                x=screen.x, y=screen.y,
+                width=screen.width, height=screen.height,
+                is_main=(displayID == main_id),
+                refresh_rate_hz=screen._current_refresh_rate(),
+                localized_name=screen._friendly_name,
+                ordinal=ordinal,
+            ))
+
+        identities = self.screen_registry.synchronize(infos)
+        for screen, identity in zip(screens, identities):
+            screen.identity = identity
+        return screens
 
 
 class CocoaScreen(Screen):
 
-    def __init__(self, display, displayID):
+    def __init__(self, display, displayID, identity=None):
         bounds = quartz.CGDisplayBounds(displayID)
         # FIX ME:
         # Probably need to convert the origin coordinates depending on context:
         # http://www.cocoabuilder.com/archive/cocoa/233492-ns-cg-rect-conversion-and-screen-coordinates.html
         x, y = bounds.origin.x, bounds.origin.y
         width, height = bounds.size.width, bounds.size.height
-        super().__init__(display, int(x), int(y), int(width), int(height))
+        super().__init__(display, int(x), int(y), int(width), int(height),
+                         identity=identity)
         self._cg_display_id = displayID
         # Save the default mode so we can restore to it.
         self._default_mode = self.get_mode()
         self._ns_screen = self.get_nsscreen()
+        self._friendly_name = self._get_localized_name()
+
+    def _get_localized_name(self):
+        """Read NSScreen.localizedName (10.15+), tolerating older macOS."""
+        if self._ns_screen is None:
+            return None
+        try:
+            screen_name = self._ns_screen.localizedName()
+        except Exception:
+            return None
+        if screen_name:
+            try:
+                return cfstring_to_string(screen_name)
+            except Exception:
+                return None
+        return None
+
+    def _current_refresh_rate(self):
+        """Raw current refresh rate in Hz; 0/unsupported stays for the mapper."""
+        if self._default_mode is not None:
+            return self._default_mode.rate
+        try:
+            cgmode = c_void_p(quartz.CGDisplayCopyDisplayMode(self._cg_display_id))
+            try:
+                return quartz.CGDisplayModeGetRefreshRate(cgmode)
+            finally:
+                quartz.CGDisplayModeRelease(cgmode)
+        except Exception:
+            return None
 
     def get_nsscreen(self):
         """Returns the NSScreen instance that matches our CGDirectDisplayID."""
@@ -117,7 +168,11 @@ class CocoaScreenMode(ScreenMode):
         self.width = int(quartz.CGDisplayModeGetWidth(cgmode))
         self.height = int(quartz.CGDisplayModeGetHeight(cgmode))
         self.depth = self.getBitsPerPixel(cgmode)
-        self.rate = quartz.CGDisplayModeGetRefreshRate(cgmode)
+        # CoreGraphics returns 0 for panels without a fixed rate; normalize
+        # that to None so invalid values are never mixed with real Hz.
+        self.rate = refresh_rate_from_cocoa(
+            quartz.CGDisplayModeGetRefreshRate(cgmode),
+        )
 
     def __del__(self):
         quartz.CGDisplayModeRelease(self.cgmode)
