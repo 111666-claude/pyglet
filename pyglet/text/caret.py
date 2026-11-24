@@ -17,17 +17,19 @@ import time
 from typing import TYPE_CHECKING, Any, Pattern
 
 from pyglet import clock, event
+from pyglet.event import EventDispatcher
 from pyglet.window import key
 
 if TYPE_CHECKING:
     from pyglet.graphics import Batch
     from pyglet.text.layout import IncrementalTextLayout
+    from pyglet.window import Window
 
 
-class Caret:
+class Caret(EventDispatcher):
     """Visible text insertion marker for `pyglet.text.layout.IncrementalTextLayout`.
 
-    The caret is drawn as a single vertical bar at the document `position` 
+    The caret is drawn as a single vertical bar at the document `position`
     on a text layout object.  If ``mark`` is not None, it gives the unmoving
     end of the current text selection.  The visible text selection on the
     layout is updated along with ``mark`` and ``position``.
@@ -45,6 +47,11 @@ class Caret:
     If the text layout is being used alongside other graphical widgets, a
     GUI toolkit will be needed to delegate keyboard and mouse events to the
     appropriate widget.  Pyglet does not provide such a toolkit at this stage.
+
+    Copy, cut and paste shortcuts use the system clipboard through the
+    optional ``window`` (or a replaceable ``clipboard``) argument.  The
+    :meth:`copy`, :meth:`cut` and :meth:`paste` methods can also be called
+    directly (for example, from context menus or tests).
     """
     _next_word_re: Pattern[str] = re.compile(r"(?<=\W)\w")
     _previous_word_re: Pattern[str] = re.compile(r"(?<=\W)\w+\W*$")
@@ -69,8 +76,29 @@ class Caret:
     _mark: int | None = None
     _next_attributes: dict[str, Any]
 
+    # Motion event produced by the platform for the same shortcut chord.
+    # When ``on_key_press`` handles a clipboard chord, the matching
+    # ``on_text_motion`` is suppressed exactly once so one physical key press
+    # cannot apply the edit twice.
+    _suppress_motion: int | None = None
+
+    # Symbol -> (action name, text-motion constant).  Both the Windows/Linux
+    # Control accelerator and the macOS Command accelerator are accepted so
+    # the same mapping works across platforms and in tests.
+    _shortcut_actions: dict[int, tuple[str, int]] = {
+        key.C: ("copy", key.MOTION_COPY),
+        key.X: ("cut", key.MOTION_CUT),
+        key.V: ("paste", key.MOTION_PASTE),
+        key.A: ("select_all", key.MOTION_SELECT_ALL),
+    }
+
     def __init__(self, layout: IncrementalTextLayout, batch: Batch | None = None,
-                 color: tuple[int, int, int, int] = (0, 0, 0, 255)) -> None:
+                 color: tuple[int, int, int, int] = (0, 0, 0, 255),
+                 window: Window | None = None,
+                 clipboard: Any | None = None,
+                 *,
+                 focused: bool | None = None,
+                 active: bool | None = None) -> None:
         """Create a caret for a layout.
 
         By default the layout's batch is used, so the caret does not need to
@@ -84,10 +112,38 @@ class Caret:
             `color` : (int, int, int, int)
                 An RGBA or RGB tuple with components in the range [0, 255].
                 RGB colors will be treated as having an opacity of 255.
+            `window` : `~pyglet.window.Window` | None
+                Window used to access the system clipboard for copy, cut and
+                paste.  The window must implement
+                :meth:`~pyglet.window.Window.get_clipboard_text` and
+                :meth:`~pyglet.window.Window.set_clipboard_text`.  Kept
+                compatible with the upstream clipboard interface.
+            `clipboard` :
+                An optional replaceable clipboard object used in preference to
+                ``window``.  It may implement the window-style
+                ``get_clipboard_text``/``set_clipboard_text`` methods, the
+                simpler ``get_text``/``set_text`` or ``get``/``set`` methods,
+                or expose a ``text`` attribute/property.  This is primarily
+                intended for tests and other non-window environments.
+            `focused` : bool | None
+                Initial focus state.  When ``False``, keyboard shortcuts and
+                clipboard text-motions are ignored.  Defaults to active.
+            `active` : bool | None
+                Alias for ``focused`` (window activation terminology).
 
         """
         from pyglet import gl
         self._layout = layout
+
+        # Clipboard / window integration.  Resolved dynamically so assigning
+        # ``caret.window`` / ``caret._window`` after construction also works.
+        self._window = window
+        self._clipboard = clipboard
+
+        if active is not None:
+            self._active = bool(active)
+        elif focused is not None:
+            self._active = bool(focused)
 
         self._custom_batch = batch is not None
         self._batch = batch or layout.batch
@@ -126,6 +182,204 @@ class Caret:
         batch = self._batch if self._custom_batch else layout.batch
         self._group = layout.foreground_decoration_group
         self._batch.migrate(self._list, GL_LINES, self._group, batch)
+
+    @property
+    def window(self) -> Window | None:
+        """Window used for system clipboard access, if any."""
+        return self._window
+
+    @window.setter
+    def window(self, window: Window | None) -> None:
+        self._window = window
+
+    @property
+    def clipboard(self) -> Any | None:
+        """Replaceable clipboard provider.
+
+        When set, this takes precedence over :attr:`window` for clipboard
+        reads and writes.  Assign ``None`` to fall back to the window.
+        """
+        return self._clipboard
+
+    @clipboard.setter
+    def clipboard(self, clipboard: Any | None) -> None:
+        self._clipboard = clipboard
+
+    @property
+    def active(self) -> bool:
+        """Whether the caret's window/control is active (and may edit)."""
+        return self._active
+
+    @active.setter
+    def active(self, active: bool) -> None:
+        self._active = bool(active)
+
+    @property
+    def focused(self) -> bool:
+        """Whether the text control has keyboard focus. Alias of :attr:`active`."""
+        return self._active
+
+    @focused.setter
+    def focused(self, focused: bool) -> None:
+        self._active = bool(focused)
+
+    def _clipboard_provider(self) -> Any | None:
+        # Resolve at call time so post-construction ``_window``/``window``
+        # assignment (common in tests) is picked up.
+        if self._clipboard is not None:
+            return self._clipboard
+        return self._window
+
+    def _get_clipboard_text(self) -> str:
+        provider = self._clipboard_provider()
+        if provider is None:
+            return ""
+
+        getter = getattr(provider, "get_clipboard_text", None)
+        if callable(getter):
+            value = getter()
+        else:
+            get_text = getattr(provider, "get_text", None)
+            if callable(get_text):
+                value = get_text()
+            else:
+                get = getattr(provider, "get", None)
+                if callable(get):
+                    value = get()
+                else:
+                    paste = getattr(provider, "paste", None)
+                    if callable(paste):
+                        # pyperclip-style provider
+                        value = paste()
+                    else:
+                        value = getattr(provider, "text", "")
+
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    def _set_clipboard_text(self, text: str) -> None:
+        provider = self._clipboard_provider()
+        if provider is None:
+            return
+
+        setter = getattr(provider, "set_clipboard_text", None)
+        if callable(setter):
+            setter(text)
+            return
+
+        set_text = getattr(provider, "set_text", None)
+        if callable(set_text):
+            set_text(text)
+            return
+
+        set = getattr(provider, "set", None)
+        if callable(set):
+            set(text)
+            return
+
+        copy = getattr(provider, "copy", None)
+        if callable(copy):
+            # pyperclip-style provider
+            copy(text)
+            return
+
+        if hasattr(provider, "text"):
+            provider.text = text
+
+    def _selected_range(self) -> tuple[int, int] | None:
+        """Return the ordered ``(start, end)`` selection, or ``None``.
+
+        ``None`` covers both "no mark" and a collapsed (empty) selection.
+        """
+        if self._mark is None:
+            return None
+        start = min(self._mark, self._position)
+        end = max(self._mark, self._position)
+        if start == end:
+            return None
+        return start, end
+
+    def _selection_text(self) -> str:
+        selection = self._selected_range()
+        if selection is None:
+            return ""
+        start, end = selection
+        return self._layout.document.text[start:end]
+
+    def _emit_clipboard_event(self, primary: str, alias: str, text: str) -> None:
+        # Upstream-compatible event name ...
+        self.dispatch_event(primary, text)
+        # ... plus a short conventional alias for toolkits/tests.
+        self.dispatch_event(alias, text)
+
+    def copy(self) -> str | None:
+        """Copy the selected text to the clipboard without modifying the document.
+
+        Returns the copied text, or ``None`` if there is no non-empty
+        selection (in which case the clipboard is left untouched, matching
+        standard desktop behaviour).
+        """
+        text = self._selection_text()
+        if not text:
+            return None
+        self._set_clipboard_text(text)
+        self._emit_clipboard_event("on_clipboard_copy", "on_copy", text)
+        self._nudge()
+        return text
+
+    def cut(self) -> str | None:
+        """Copy the selection to the clipboard and delete only that selection.
+
+        Returns the removed text, or ``None`` when there is no non-empty
+        selection (nothing is deleted and the clipboard is left untouched).
+        """
+        selection = self._selected_range()
+        if selection is None:
+            return None
+        text = self._selection_text()
+        self._set_clipboard_text(text)
+        self._delete_selection()
+        self._emit_clipboard_event("on_clipboard_cut", "on_cut", text)
+        self._nudge()
+        return text
+
+    def paste(self, text: str | None = None) -> str:
+        """Replace the selection with clipboard text and insert at the caret.
+
+        :Parameters:
+            `text` : str | None
+                Text to insert.  When omitted, the current clipboard text is
+                used.  Carriage returns (including CRLF) are normalised to
+                newlines.  An empty value is a no-op.
+
+        After pasting, the caret is positioned after the inserted text and
+        any selection is cleared.  Returns the inserted text (``""`` for an
+        empty clipboard).
+        """
+        if text is None:
+            text = self._get_clipboard_text()
+        if text is None:
+            text = ""
+        elif not isinstance(text, str):
+            text = str(text)
+
+        # Normalise Windows CRLF and lone CR to LF without doubling newlines.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not text:
+            return ""
+
+        if self._mark is not None:
+            self._delete_selection()
+
+        pos = self._position
+        self._position += len(text)
+        self._layout.document.insert_text(pos, text, self._next_attributes)
+        self._nudge()
+        self._emit_clipboard_event("on_clipboard_paste", "on_paste", text)
+        return text
 
     def delete(self) -> None:
         """Remove the caret from its batch.
@@ -387,6 +641,45 @@ class Caret:
             self.position = len(self._layout.document.text)
         self._update()
 
+    def on_key_press(self, symbol: int, modifiers: int) -> bool | None:
+        """Handler for the `pyglet.window.Window.on_key_press` event.
+
+        Handles the common desktop editing shortcuts:
+
+        * ``Ctrl+C`` / ``Command+C``: copy
+        * ``Ctrl+X`` / ``Command+X``: cut
+        * ``Ctrl+V`` / ``Command+V``: paste
+        * ``Ctrl+A`` / ``Command+A``: select all
+
+        Both the Windows/Linux Control accelerator and the macOS Command
+        accelerator are accepted.  Returning ``EVENT_UNHANDLED`` for every
+        other key preserves the existing keyboard-navigation / event
+        propagation behaviour.
+        """
+        if not self._active:
+            return event.EVENT_UNHANDLED
+
+        # A new physical press begins a fresh gesture.
+        self._suppress_motion = None
+
+        if modifiers & (key.MOD_CTRL | key.MOD_COMMAND):
+            action = self._shortcut_actions.get(symbol)
+            if action is not None:
+                method_name, motion = action
+                if method_name == "select_all":
+                    self.select_all()
+                else:
+                    getattr(self, method_name)()
+
+                # The platform backend (e.g. X11/Win32 motion map) may also
+                # deliver the equivalent on_text_motion for this exact chord.
+                # Arm a one-shot suppression so that paired event cannot apply
+                # the same edit a second time.
+                self._suppress_motion = motion
+                return event.EVENT_HANDLED
+
+        return event.EVENT_UNHANDLED
+
     def on_text(self, text: str) -> bool:
         """Handler for the `pyglet.window.Window.on_text` event.
 
@@ -394,6 +687,20 @@ class Caret:
         GUI toolkits should filter keyboard and text events by widget focus
         before invoking this handler.
         """
+        # A text event means the platform did not emit the paired text-motion
+        # for the preceding key press; drop any stale suppression token.
+        self._suppress_motion = None
+
+        # Shortcut chords can also produce C0 control characters (for example
+        # Ctrl+C -> "\x03", Ctrl+V -> "\x16").  Never insert these, otherwise a
+        # single key press could both run the shortcut and insert garbage /
+        # duplicate text.  Tab, newline and carriage return remain editable.
+        if text:
+            text = "".join(ch for ch in text
+                           if ch in "\t\n\r" or (ord(ch) >= 0x20 and ord(ch) != 0x7F))
+        if not text:
+            return event.EVENT_HANDLED
+
         if self._mark is not None:
             self._delete_selection()
 
@@ -411,6 +718,32 @@ class Caret:
         GUI toolkits should filter keyboard and text events by widget focus
         before invoking this handler.
         """
+        # If the matching shortcut was already applied in ``on_key_press`` for
+        # this same physical key press, consume and ignore the paired motion so
+        # the edit is not applied twice.
+        if self._suppress_motion is not None:
+            suppressed_motion = self._suppress_motion
+            self._suppress_motion = None
+            if motion == suppressed_motion:
+                return event.EVENT_HANDLED
+
+        # Clipboard and select-all motions.  These return early so the generic
+        # navigation tail below does not collapse a selection that copy should
+        # preserve (paste/cut already reset the selection themselves).
+        if motion in (key.MOTION_COPY, key.MOTION_CUT,
+                      key.MOTION_PASTE, key.MOTION_SELECT_ALL):
+            if not self._active:
+                return event.EVENT_UNHANDLED
+            if motion == key.MOTION_COPY:
+                self.copy()
+            elif motion == key.MOTION_CUT:
+                self.cut()
+            elif motion == key.MOTION_PASTE:
+                self.paste()
+            else:
+                self.select_all()
+            return event.EVENT_HANDLED
+
         if motion == key.MOTION_BACKSPACE:
             if self.mark is not None:
                 self._delete_selection()
@@ -564,3 +897,43 @@ class Caret:
         self._active = False
         self.visible = self._active
         return event.EVENT_HANDLED
+
+    def on_clipboard_copy(self, text: str) -> bool:  # noqa: ARG002
+        """Dispatched after text is copied to the clipboard.
+
+        The default handler does nothing.  Attach a handler or subclass and
+        override this to react to copies.
+        """
+        return event.EVENT_HANDLED
+
+    def on_clipboard_cut(self, text: str) -> bool:  # noqa: ARG002
+        """Dispatched after selected text is cut to the clipboard.
+
+        The default handler does nothing.
+        """
+        return event.EVENT_HANDLED
+
+    def on_clipboard_paste(self, text: str) -> bool:  # noqa: ARG002
+        """Dispatched after text is pasted into the document.
+
+        The default handler does nothing.
+        """
+        return event.EVENT_HANDLED
+
+    # Short conventional aliases for the ``on_clipboard_*`` events.
+    def on_copy(self, text: str) -> bool:  # noqa: ARG002
+        return event.EVENT_HANDLED
+
+    def on_cut(self, text: str) -> bool:  # noqa: ARG002
+        return event.EVENT_HANDLED
+
+    def on_paste(self, text: str) -> bool:  # noqa: ARG002
+        return event.EVENT_HANDLED
+
+
+Caret.register_event_type("on_clipboard_copy")
+Caret.register_event_type("on_clipboard_cut")
+Caret.register_event_type("on_clipboard_paste")
+Caret.register_event_type("on_copy")
+Caret.register_event_type("on_cut")
+Caret.register_event_type("on_paste")

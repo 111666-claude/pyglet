@@ -1687,6 +1687,10 @@ class BaseWindow(EventDispatcher, metaclass=_WindowMetaclass):
             * MOTION_END_OF_FILE
             * MOTION_BACKSPACE
             * MOTION_DELETE
+            * MOTION_COPY
+            * MOTION_CUT
+            * MOTION_PASTE
+            * MOTION_SELECT_ALL
 
             :event:
             """

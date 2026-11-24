@@ -100,7 +100,9 @@ _motion_map: dict[tuple[int, bool], int] = {
     (key.BACKSPACE, False): key.MOTION_BACKSPACE,
     (key.DELETE, False): key.MOTION_DELETE,
     (key.C, True): key.MOTION_COPY,
+    (key.X, True): key.MOTION_CUT,
     (key.V, True): key.MOTION_PASTE,
+    (key.A, True): key.MOTION_SELECT_ALL,
 }
 
 

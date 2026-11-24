@@ -460,7 +460,9 @@ class TextEntry(WidgetBase):
                  text_color: tuple[int, int, int, int] = (0, 0, 0, 255),
                  caret_color: tuple[int, int, int, int] = (0, 0, 0, 255),
                  batch: Batch | None = None,
-                 group: Group | None = None) -> None:
+                 group: Group | None = None,
+                 window: pyglet.window.Window | None = None,
+                 clipboard: object | None = None) -> None:
         """Create a text entry widget.
 
         Args:
@@ -498,7 +500,7 @@ class TextEntry(WidgetBase):
 
         # Text and Caret:
         self._layout = IncrementalTextLayout(self._doc, x, y, 0, width, height, batch=batch, group=fg_group)
-        self._caret = Caret(self._layout, color=caret_color)
+        self._caret = Caret(self._layout, color=caret_color, window=window, clipboard=clipboard)
         self._caret.visible = False
 
         self._focus = False
@@ -576,6 +578,15 @@ class TextEntry(WidgetBase):
             self._caret.on_mouse_press(x, y, buttons, modifiers)
         else:
             self._set_focus(False)
+
+    def on_key_press(self, symbol: int, modifiers: int) -> bool | None:
+        if not self.enabled:
+            return None
+        if self._focus:
+            # Routes copy/cut/paste/select-all shortcuts (and any future
+            # Caret key handling) to the active text caret.
+            return self._caret.on_key_press(symbol, modifiers)
+        return None
 
     def on_text(self, text: str) -> None:
         if not self.enabled:

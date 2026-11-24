@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 import pyglet
 
 from pyglet.text import caret, document, layout  # noqa: F401
+from pyglet.text.caret import Caret  # noqa: F401
 
 
 if TYPE_CHECKING:
