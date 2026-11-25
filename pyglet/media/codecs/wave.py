@@ -25,7 +25,11 @@ class WaveSource(StreamingSource):
 
         nchannels, sampwidth, framerate, nframes, comptype, compname = self._wave.getparams()
 
-        self.audio_format = AudioFormat(channels=nchannels, sample_size=sampwidth * 8, sample_rate=framerate)
+        # The standard library wave module only reads PCM data: 8 bit
+        # samples are unsigned, wider samples are signed integers.
+        sample_type = 'u' if sampwidth == 1 else 's'
+        self.audio_format = AudioFormat(channels=nchannels, sample_size=sampwidth * 8,
+                                        sample_rate=framerate, sample_type=sample_type)
 
         self._bytes_per_frame = nchannels * sampwidth
         self._duration = nframes / framerate
@@ -95,9 +99,13 @@ class WaveEncoder(MediaEncoder):
             opened_file = True
 
         source.seek(0)
+        if source.audio_format.sample_type == 'f':
+            raise WAVEDecodeException(
+                'Cannot encode floating point samples with the wave module; '
+                'only integer PCM is supported.')
         wave_writer = wave.open(file, mode='wb')
         wave_writer.setnchannels(source.audio_format.channels)
-        wave_writer.setsampwidth(source.audio_format.bytes_per_sample)
+        wave_writer.setsampwidth(source.audio_format.sample_size // 8)
         wave_writer.setframerate(source.audio_format.sample_rate)
         # Save the data in 1-second chunks:
         chunksize = source.audio_format.bytes_per_second

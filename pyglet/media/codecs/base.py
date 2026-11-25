@@ -23,14 +23,40 @@ class AudioFormat:
     Args:
         channels (int): The number of channels: 1 for mono or 2 for stereo
             (pyglet does not yet support surround-sound sources).
-        sample_size (int): Bits per sample; only 8 or 16 are supported.
+        sample_size (int): Bits per sample; 8, 16, 24 and 32 are supported.
         sample_rate (int): Samples per second (in Hertz).
+        sample_type (str): The type of each sample, one of ``'u'`` (unsigned
+            integer), ``'s'`` (signed integer) or ``'f'`` (floating point).
+            This allows to distinguish 32 bit integer PCM from 32 bit float
+            PCM, which share the same ``sample_size``.  If ``None``, a
+            backward compatible default is assumed: ``'u'`` for 8 bit
+            samples and ``'s'`` for anything else.  Floating point samples
+            are only defined for 32 (and 64) bit sample sizes.
+
+            .. versionadded:: 2.2
     """
 
-    def __init__(self, channels: int, sample_size: int, sample_rate: int) -> None:
+    #: Recognized values for :attr:`sample_type`: unsigned integer, signed
+    #: integer and floating point.
+    SAMPLE_TYPES = ('u', 's', 'f')
+
+    def __init__(self, channels: int, sample_size: int, sample_rate: int,
+                 sample_type: Optional[str] = None) -> None:
+        if sample_type is None:
+            # Backward compatible default: 8 bit PCM is unsigned, everything
+            # else was historically treated as signed integer.
+            sample_type = 'u' if sample_size == 8 else 's'
+        if sample_type not in self.SAMPLE_TYPES:
+            raise ValueError(f"Invalid sample_type: {sample_type!r}. "
+                             f"Must be one of {self.SAMPLE_TYPES}.")
+        if sample_type == 'f' and sample_size not in (32, 64):
+            raise ValueError(f"Floating point samples must be 32 or 64 bit, "
+                             f"not {sample_size} bit.")
+
         self.channels = channels
         self.sample_size = sample_size
         self.sample_rate = sample_rate
+        self.sample_type = sample_type
 
         # Convenience
 
@@ -69,13 +95,14 @@ class AudioFormat:
         if isinstance(other, AudioFormat):
             return (self.channels == other.channels and
                     self.sample_size == other.sample_size and
-                    self.sample_rate == other.sample_rate)
+                    self.sample_rate == other.sample_rate and
+                    self.sample_type == other.sample_type)
         return NotImplemented
 
     def __repr__(self) -> str:
-        return '%s(channels=%d, sample_size=%d, sample_rate=%d)' % (
+        return '%s(channels=%d, sample_size=%d, sample_rate=%d, sample_type=%r)' % (
             self.__class__.__name__, self.channels, self.sample_size,
-            self.sample_rate)
+            self.sample_rate, self.sample_type)
 
 
 class VideoFormat:

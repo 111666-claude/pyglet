@@ -24,6 +24,45 @@ class OpenALException(MediaException):
             return f'OpenAL Exception [{self.error_code}: {self.error_string}]: {self.message}'
 
 
+def get_openal_format(audio_format, float32_supported=False):
+    """Return the OpenAL buffer format enum for the given audio format.
+
+    32 bit floating point audio requires the ``AL_EXT_float32`` extension;
+    pass ``float32_supported=True`` if the current context provides it.
+
+    Raises:
+        MediaException: If the format cannot be played by OpenAL.  In
+            particular, 32 bit integer PCM has no OpenAL equivalent and is
+            always rejected rather than being played at a wrong bit depth.
+    """
+    _format_map = {
+        (1, 8, 'u'): al.AL_FORMAT_MONO8,
+        (1, 16, 's'): al.AL_FORMAT_MONO16,
+        (2, 8, 'u'): al.AL_FORMAT_STEREO8,
+        (2, 16, 's'): al.AL_FORMAT_STEREO16,
+    }
+    if float32_supported:
+        _format_map[(1, 32, 'f')] = al.AL_FORMAT_MONO_FLOAT32
+        _format_map[(2, 32, 'f')] = al.AL_FORMAT_STEREO_FLOAT32
+
+    key = (audio_format.channels, audio_format.sample_size, audio_format.sample_type)
+    try:
+        return _format_map[key]
+    except KeyError:
+        raise MediaException(
+            f"OpenAL does not support {audio_format.sample_size}bit "
+            f"'{audio_format.sample_type}' audio with {audio_format.channels} "
+            f"channel(s).")
+
+
+def get_al_extensions():
+    """Return the list of OpenAL extensions of the current context."""
+    extensions = al.alGetString(al.AL_EXTENSIONS)
+    if not extensions:
+        return []
+    return ctypes.cast(extensions, ctypes.c_char_p).value.decode('ascii').split()
+
+
 class OpenALObject:
     """Base class for OpenAL objects."""
     @classmethod
@@ -384,16 +423,10 @@ class OpenALListener(OpenALObject):
 
 
 class OpenALBuffer(OpenALObject):
-    _format_map = {
-        (1,  8): al.AL_FORMAT_MONO8,
-        (1, 16): al.AL_FORMAT_MONO16,
-        (2,  8): al.AL_FORMAT_STEREO8,
-        (2, 16): al.AL_FORMAT_STEREO16,
-    }
-
-    def __init__(self, al_name):
+    def __init__(self, al_name, float32_supported=False):
         self.al_name = al_name
         self.name = al_name.value
+        self.float32_supported = float32_supported
 
         assert self.is_valid
 
@@ -417,10 +450,7 @@ class OpenALBuffer(OpenALObject):
     def data(self, audio_data, audio_format):
         assert self.is_valid
 
-        try:
-            al_format = self._format_map[(audio_format.channels, audio_format.sample_size)]
-        except KeyError:
-            raise MediaException(f"OpenAL does not support '{audio_format.sample_size}bit' audio.")
+        al_format = get_openal_format(audio_format, self.float32_supported)
 
         al.alBufferData(self.al_name,
                         al_format,
@@ -437,6 +467,10 @@ class OpenALBufferPool(OpenALObject):
     def __init__(self):
         self._buffers = []
         """List of free buffer names"""
+
+        self.float32_supported = False
+        """Whether the current context provides AL_EXT_float32. Set by the
+        driver once a context is current."""
 
     def __len__(self):
         return len(self._buffers)
@@ -468,7 +502,7 @@ class OpenALBufferPool(OpenALObject):
             names = (al.ALuint * missing)()
             al.alGenBuffers(missing, names)
             self._check_error('Error generating buffers.')
-            ret_buffers.extend(OpenALBuffer(al.ALuint(name)) for name in names)
+            ret_buffers.extend(OpenALBuffer(al.ALuint(name), self.float32_supported) for name in names)
 
         return ret_buffers
 

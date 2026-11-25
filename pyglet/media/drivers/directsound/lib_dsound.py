@@ -41,6 +41,7 @@ class WAVEFORMATEX(ctypes.Structure):
                        self.cbSize)
 LPWAVEFORMATEX = ctypes.POINTER(WAVEFORMATEX)
 WAVE_FORMAT_PCM = 1
+WAVE_FORMAT_IEEE_FLOAT = 3
 
 class DSCAPS(ctypes.Structure):
     _fields_ = [

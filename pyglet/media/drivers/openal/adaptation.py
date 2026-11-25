@@ -23,6 +23,11 @@ class OpenALDriver(AbstractAudioDriver):
         self.context = self.device.create_context()
         self.context.make_current()
 
+        # 32 bit float playback requires the AL_EXT_float32 extension; the
+        # buffer pool passes this on to the buffers it creates.
+        self.device.buffer_pool.float32_supported = (
+            'AL_EXT_float32' in interface.get_al_extensions())
+
         self._listener = OpenALListener(self)
 
         self.worker = PlayerWorkerThread()

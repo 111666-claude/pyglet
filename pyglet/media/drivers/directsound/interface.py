@@ -21,7 +21,10 @@ def _check(hresult):
 
 def _create_wave_format(audio_format):
     wfx = lib.WAVEFORMATEX()
-    wfx.wFormatTag = lib.WAVE_FORMAT_PCM
+    if audio_format.sample_type == 'f':
+        wfx.wFormatTag = lib.WAVE_FORMAT_IEEE_FLOAT
+    else:
+        wfx.wFormatTag = lib.WAVE_FORMAT_PCM
     wfx.nChannels = audio_format.channels
     wfx.nSamplesPerSec = audio_format.sample_rate
     wfx.wBitsPerSample = audio_format.sample_size

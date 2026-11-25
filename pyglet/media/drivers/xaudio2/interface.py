@@ -28,7 +28,10 @@ def create_xa2_buffer(audio_data):
 
 def create_xa2_waveformat(audio_format):
     wfx = lib.WAVEFORMATEX()
-    wfx.wFormatTag = lib.WAVE_FORMAT_PCM
+    if audio_format.sample_type == 'f':
+        wfx.wFormatTag = lib.WAVE_FORMAT_IEEE_FLOAT
+    else:
+        wfx.wFormatTag = lib.WAVE_FORMAT_PCM
     wfx.nChannels = audio_format.channels
     wfx.nSamplesPerSec = audio_format.sample_rate
     wfx.wBitsPerSample = audio_format.sample_size
@@ -378,7 +381,7 @@ class XAudio2Driver:
         self._in_use.pop(voice)
 
         assert _debug(f"XA2AudioDriver: Resetting {voice}...")
-        voice_key = (voice.channel_count, voice.sample_size)
+        voice_key = (voice.channel_count, voice.sample_size, voice.sample_type)
         resetter = _VoiceResetter(self, voice, voice_key, remaining_data)
         self._resetting_voices[voice] = resetter
         resetter.run()
@@ -393,7 +396,7 @@ class XAudio2Driver:
         So pooling is recommended. We pool based on audio channels.
         A source voice handles all of the audio playing and state for a single source."""
 
-        voice_key = (audio_format.channels, audio_format.sample_size)
+        voice_key = (audio_format.channels, audio_format.sample_size, audio_format.sample_type)
         if not self._voice_pool[voice_key]:
             voice = self._create_new_voice(audio_format)
             # Create a 2nd one for good measure, multiple players might be needing it soon,
@@ -426,17 +429,19 @@ class XAudio2Driver:
                                         callback,
                                         None,
                                         None)
-        return XA2SourceVoice(voice, callback, audio_format.channels, audio_format.sample_size)
+        return XA2SourceVoice(voice, callback, audio_format.channels, audio_format.sample_size,
+                              audio_format.sample_type)
 
 
 class XA2SourceVoice:
-    def __init__(self, voice, callback, channel_count, sample_size):
+    def __init__(self, voice, callback, channel_count, sample_size, sample_type='s'):
         self._voice_state = lib.XAUDIO2_VOICE_STATE()  # Used for buffer state, will be reused constantly.
         self._voice = voice
         self._callback = callback
 
         self.channel_count = channel_count
         self.sample_size = sample_size
+        self.sample_type = sample_type
 
         # How many samples the voice had played when it was most recently readded into the
         # pool of available voices.

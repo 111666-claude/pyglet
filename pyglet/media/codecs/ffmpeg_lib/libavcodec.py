@@ -67,7 +67,7 @@ AVPacket_Fields = [
 compat.add_version_changes('avcodec', 58, AVPacket, AVPacket_Fields,
                            removals=('opaque', 'opaque_ref', 'time_base'))
 
-for compat_ver in (59, 60, 61):
+for compat_ver in (59, 60, 61, 62):
     compat.add_version_changes('avcodec', compat_ver, AVPacket, AVPacket_Fields,
                                removals=('convergence_duration',))
 
@@ -119,6 +119,9 @@ for compat_ver in (58, 59, 60):
                                removals=('coded_side_data', 'nb_coded_side_data', 'ch_layout', 'framerate'))
 
 compat.add_version_changes('avcodec', 61, AVCodecParameters, AVCodecParameters_Fields,
+                           removals=('channel_layout', 'channels'))
+
+compat.add_version_changes('avcodec', 62, AVCodecParameters, AVCodecParameters_Fields,
                            removals=('channel_layout', 'channels'))
 
 
@@ -365,6 +368,18 @@ if avcodec_version >= 61:
     ]
 
     compat.add_version_changes('avcodec', 61, AVCodecContext, AVCodecContext_Fields, removals=None)
+
+    # avcodec 62 (FFmpeg 8.x): 'ticks_per_frame' was removed and 'get_buffer2'
+    # (missing from the list above) sits between 'seek_preroll' and
+    # 'bit_rate_tolerance'.
+    AVCodecContext_Fields_62 = [field for field in AVCodecContext_Fields
+                                if field[0] != 'ticks_per_frame']
+    _seek_preroll_idx = [i for i, field in enumerate(AVCodecContext_Fields_62)
+                         if field[0] == 'seek_preroll'][0]
+    AVCodecContext_Fields_62.insert(
+        _seek_preroll_idx + 1,
+        ('get_buffer2', CFUNCTYPE(c_int, POINTER(AVCodecContext), POINTER(AVFrame), c_int)))
+    compat.add_version_changes('avcodec', 62, AVCodecContext, AVCodecContext_Fields_62, removals=None)
 
 else:
     AVCodecContext_Fields = [

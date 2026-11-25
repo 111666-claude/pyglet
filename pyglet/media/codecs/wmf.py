@@ -571,9 +571,13 @@ class WMFSource(Source):
                                                 0)
 
             self._wfx = wfx.contents
+            # WAVE_FORMAT_PCM (1) is integer, WAVE_FORMAT_IEEE_FLOAT (3) is float.
+            sample_type = 'f' if self._wfx.wFormatTag == 3 else (
+                'u' if self._wfx.wBitsPerSample == 8 else 's')
             self.audio_format = AudioFormat(channels=self._wfx.nChannels,
                                             sample_size=self._wfx.wBitsPerSample,
-                                            sample_rate=self._wfx.nSamplesPerSec)
+                                            sample_rate=self._wfx.nSamplesPerSec,
+                                            sample_type=sample_type)
         else:
             assert _debug('WMFAudioDecoder: Audio stream not found')
 

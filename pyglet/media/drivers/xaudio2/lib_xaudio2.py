@@ -192,6 +192,7 @@ XAUDIO2_DEFAULT_CHANNELS = 0  # Used in CreateMasteringVoice
 XAUDIO2_DEFAULT_SAMPLERATE = 0  # Used in CreateMasteringVoice
 
 WAVE_FORMAT_PCM = 1
+WAVE_FORMAT_IEEE_FLOAT = 3
 
 XAUDIO2_DEBUG_ENGINE =            0x0001    # Used in XAudio2Create
 XAUDIO2_VOICE_NOPITCH =           0x0002    # Used in IXAudio2::CreateSourceVoice

@@ -374,16 +374,23 @@ class PulseAudioStream(PulseAudioMainloopChild):
         Create a PulseAudio sample spec from pyglet audio format.
         """
         _FORMATS = {
-            ('little', 8):  pa.PA_SAMPLE_U8,
-            ('big', 8):     pa.PA_SAMPLE_U8,
-            ('little', 16): pa.PA_SAMPLE_S16LE,
-            ('big', 16):    pa.PA_SAMPLE_S16BE,
-            ('little', 24): pa.PA_SAMPLE_S24LE,
-            ('big', 24):    pa.PA_SAMPLE_S24BE,
+            ('little', 8, 'u'):  pa.PA_SAMPLE_U8,
+            ('big', 8, 'u'):     pa.PA_SAMPLE_U8,
+            ('little', 16, 's'): pa.PA_SAMPLE_S16LE,
+            ('big', 16, 's'):    pa.PA_SAMPLE_S16BE,
+            ('little', 24, 's'): pa.PA_SAMPLE_S24LE,
+            ('big', 24, 's'):    pa.PA_SAMPLE_S24BE,
+            ('little', 32, 's'): pa.PA_SAMPLE_S32LE,
+            ('big', 32, 's'):    pa.PA_SAMPLE_S32BE,
+            ('little', 32, 'f'): pa.PA_SAMPLE_FLOAT32LE,
+            ('big', 32, 'f'):    pa.PA_SAMPLE_FLOAT32BE,
         }
-        fmt = (sys.byteorder, audio_format.sample_size) 
+        fmt = (sys.byteorder, audio_format.sample_size, audio_format.sample_type)
         if fmt not in _FORMATS:
-            raise MediaException(f'Unsupported sample size/format: {fmt}')
+            raise MediaException(
+                f'Unsupported sample size/format: {fmt}. PulseAudio cannot play '
+                f'{audio_format.sample_size}bit {audio_format.sample_type!r} samples '
+                f'on a {sys.byteorder}-endian system.')
 
         sample_spec = pa.pa_sample_spec()
         sample_spec.format = _FORMATS[fmt]

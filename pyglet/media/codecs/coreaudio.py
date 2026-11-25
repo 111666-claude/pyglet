@@ -96,9 +96,16 @@ class CoreAudioSource(StreamingSource):
             byref(length)
         ))
 
+        if self.convert_desc.mFormatFlags & ca.kAudioFormatFlagIsFloat:
+            sample_type = 'f'
+        elif self.convert_desc.mFormatFlags & ca.kAudioFormatFlagIsSignedInteger:
+            sample_type = 's'
+        else:
+            sample_type = 'u'
         self.audio_format = AudioFormat(channels=self.convert_desc.mChannelsPerFrame,
                                         sample_size=self.convert_desc.mBitsPerChannel,
-                                        sample_rate=int(self.convert_desc.mSampleRate))
+                                        sample_rate=int(self.convert_desc.mSampleRate),
+                                        sample_type=sample_type)
 
         self._num_frames = length.value
         self._bytes_per_frame = self.convert_desc.mBytesPerFrame

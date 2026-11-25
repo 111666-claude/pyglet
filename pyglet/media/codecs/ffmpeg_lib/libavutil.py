@@ -201,6 +201,14 @@ compat.add_version_changes('avutil', 59, AVFrame, AVFrame_Fields,
                                      'coded_picture_number', 'display_picture_number', 'reordered_opaque', 'pkt_duration'
                                      ))
 
+compat.add_version_changes('avutil', 60, AVFrame, AVFrame_Fields,
+                           removals=('pkt_pts', 'error', 'qscale_table', 'qstride', 'qscale_type', 'qp_table_buf',
+                                     'channels', 'channel_layout',
+                                     'coded_picture_number', 'display_picture_number', 'reordered_opaque', 'pkt_duration',
+                                     'key_frame', 'interlaced_frame', 'top_field_first', 'palette_has_changed',
+                                     'pkt_pos', 'pkt_size'
+                                     ))
+
 
 AV_NOPTS_VALUE = -0x8000000000000000
 AV_TIME_BASE = 1000000

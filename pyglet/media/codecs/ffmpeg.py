@@ -45,6 +45,7 @@ from .ffmpeg_lib.libavformat import AVCodecContext, AVFormatContext, avformat, a
 from .ffmpeg_lib.libavutil import (
     AV_NOPTS_VALUE,
     AV_PIX_FMT_RGBA,
+    AV_SAMPLE_FMT_DBLP,
     AV_SAMPLE_FMT_FLT,
     AV_SAMPLE_FMT_FLTP,
     AV_SAMPLE_FMT_S16,
@@ -53,6 +54,7 @@ from .ffmpeg_lib.libavutil import (
     AV_SAMPLE_FMT_S32P,
     AV_SAMPLE_FMT_U8,
     AV_SAMPLE_FMT_U8P,
+    AV_SAMPLE_FORMAT_DOUBLE,
     AV_TIME_BASE,
     AV_TIME_BASE_Q,
     AVMEDIA_TYPE_AUDIO,
@@ -101,6 +103,7 @@ class StreamAudioInfo:
     sample_rate: int
     channels: int
     sample_bits: int | None = None
+    sample_type: str | None = None
 
 
 class FFmpegFile(Structure):
@@ -387,14 +390,23 @@ def ffmpeg_stream_info(file: FFmpegFile, stream_index: int) -> StreamAudioInfo |
         )
         if context.format in (AV_SAMPLE_FMT_U8, AV_SAMPLE_FMT_U8P):
             info.sample_bits = 8
-        elif context.format in (AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P,
-                                AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP):
+            info.sample_type = 'u'
+        elif context.format in (AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P):
             info.sample_bits = 16
+            info.sample_type = 's'
         elif context.format in (AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_S32P):
             info.sample_bits = 32
+            info.sample_type = 's'
+        elif context.format in (AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP,
+                                AV_SAMPLE_FORMAT_DOUBLE, AV_SAMPLE_FMT_DBLP):
+            # Double precision samples are converted to single precision
+            # float during decoding.
+            info.sample_bits = 32
+            info.sample_type = 'f'
         else:
             info.sample_format = None
             info.sample_bits = None
+            info.sample_type = None
     else:
         return None
     return info
@@ -634,13 +646,14 @@ class FFmpegSource(StreamingSource):
                 self._video_stream = stream
                 self._video_stream_index = i
 
-            elif isinstance(info, StreamAudioInfo) and info.sample_bits in (8, 16, 24) and self._audio_stream is None:
+            elif isinstance(info, StreamAudioInfo) and info.sample_bits is not None and self._audio_stream is None:
                 stream = ffmpeg_open_stream(self._file, i)
 
                 self.audio_format = AudioFormat(
                     channels=min(2, info.channels),
                     sample_size=info.sample_bits,
-                    sample_rate=info.sample_rate)
+                    sample_rate=info.sample_rate,
+                    sample_type=info.sample_type)
                 self._audio_stream = stream
                 self._audio_stream_index = i
 
@@ -657,8 +670,9 @@ class FFmpegSource(StreamingSource):
                     self.tgt_format = AV_SAMPLE_FMT_S16
                 elif sample_format in (AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_S32P):
                     self.tgt_format = AV_SAMPLE_FMT_S32
-                elif sample_format in (AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP):
-                    self.tgt_format = AV_SAMPLE_FMT_S16
+                elif sample_format in (AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP,
+                                       AV_SAMPLE_FORMAT_DOUBLE, AV_SAMPLE_FMT_DBLP):
+                    self.tgt_format = AV_SAMPLE_FMT_FLT
                 else:
                     raise FFmpegException('Audio format not supported.')
 

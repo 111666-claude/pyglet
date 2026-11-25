@@ -63,9 +63,18 @@ class _MessageHandler:
         self.source._duration = pad.get_peer().query_duration(Gst.Format.TIME).duration / Gst.SECOND
         channels = info.get_int('channels')[1]
         sample_rate = info.get_int('rate')[1]
-        sample_size = int("".join(filter(str.isdigit, info.get_string('format'))))
+        sample_format = info.get_string('format')
+        sample_size = int("".join(filter(str.isdigit, sample_format)))
+        # GStreamer format names are like 'S16LE', 'U8', 'F32LE'.
+        if sample_format.startswith('F'):
+            sample_type = 'f'
+        elif sample_format.startswith('U'):
+            sample_type = 'u'
+        else:
+            sample_type = 's'
 
-        self.source.audio_format = AudioFormat(channels=channels, sample_size=sample_size, sample_rate=sample_rate)
+        self.source.audio_format = AudioFormat(channels=channels, sample_size=sample_size,
+                                               sample_rate=sample_rate, sample_type=sample_type)
 
         # Allow GStreamerSource.__init__ to complete:
         self.source.is_ready.set()

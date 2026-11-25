@@ -152,6 +152,12 @@ for compat_ver in (60, 61):
                                removals=('codec', 'recommended_encoder_configuration', 'info'),
                                repositions=(compat.Reposition("codecpar", "id"),))
 
+# avformat 62 (FFmpeg 8.x) removed AVStream.side_data / nb_side_data.
+compat.add_version_changes('avformat', 62, AVStream, AVStream_Fields,
+                           removals=('codec', 'recommended_encoder_configuration', 'info',
+                                     'side_data', 'nb_side_data'),
+                           repositions=(compat.Reposition("codecpar", "id"),))
+
 
 class AVProgram(Structure):
     pass
@@ -319,6 +325,12 @@ if avformat_version >= 61:
     ]
 
     compat.add_version_changes('avformat', 61, AVFormatContext, AVFormatContext_Fields, removals=None)
+
+    # avformat 62 (FFmpeg 8.x) removed the per-stream codec IDs and the
+    # control message callback from AVFormatContext.
+    compat.add_version_changes('avformat', 62, AVFormatContext, AVFormatContext_Fields,
+                               removals=('video_codec_id', 'audio_codec_id', 'subtitle_codec_id',
+                                         'data_codec_id', 'control_message_cb'))
 
 
 else:
