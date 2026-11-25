@@ -782,7 +782,7 @@ class IncrementalTextLayout(TextLayout, EventDispatcher):
         else:
             line = self.lines[line_idx]
 
-        x = line.x
+        x = round(line.x)
 
         baseline = self._document.get_style("baseline", max(0, position - 1))
         if baseline is None:
@@ -839,11 +839,12 @@ class IncrementalTextLayout(TextLayout, EventDispatcher):
         x += self._translate_x
         x -= self.left
 
-        if x < line.x:
+        line_x = round(line.x)
+        if x < line_x:
             return line.start
 
         position = line.start
-        last_glyph_x = line.x
+        last_glyph_x = line_x
         for box in line.boxes:
             if 0 <= x - last_glyph_x < box.advance:
                 position += box.get_position_in_box(x - last_glyph_x)

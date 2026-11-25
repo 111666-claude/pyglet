@@ -414,7 +414,8 @@ class _GlyphBox(_AbstractBox):
     advance: int
     vertex_lists: list[_LayoutVertexList]
 
-    def __init__(self, owner: Texture, font: Font, glyphs: list[tuple[int, Glyph]], advance: int) -> None:
+    def __init__(self, owner: Texture, font: Font, glyphs: list[tuple[int, Glyph]],
+                 advance: float | None = None) -> None:  # noqa: ARG002
         """Create a run of glyphs sharing the same texture.
 
         :Parameters:
@@ -425,18 +426,25 @@ class _GlyphBox(_AbstractBox):
             `glyphs` : list of (int, `pyglet.font.base.Glyph`)
                 Pairs of ``(kern, glyph)``, where ``kern`` gives horizontal
                 displacement of the glyph in pixels (typically 0).
-            `advance` : int
-                Width of glyph run; must correspond to the sum of advances
-                and kerns in the glyph list.
+            `advance` :
+                Compatibility argument for callers that already computed the
+                raw run width.  Hit-testing and drawing use the sum of the
+                same pixel-rounded per-glyph advances.
 
         """
-        super().__init__(font.ascent, font.descent, advance, len(glyphs))
+        rounded_advance = sum(self._glyph_advance(kern, glyph) for kern, glyph in glyphs)
+        super().__init__(font.ascent, font.descent, rounded_advance, len(glyphs))
         assert owner
         self.owner = owner
         self.font = font
         self.glyphs = glyphs
-        self.advance = advance
+        self.advance = rounded_advance
         self.vertex_lists = []
+
+    @staticmethod
+    def _glyph_advance(kern: float, glyph: Glyph) -> int:
+        """Return the rounded advance shared by drawing and coordinate maps."""
+        return round(kern) + round(glyph.advance)
 
     def _add_vertex_list(self, vertex_list: _LayoutVertexList | VertexList, context: _LayoutContext) -> None:
         self.vertex_lists.append(vertex_list)
@@ -459,12 +467,12 @@ class _GlyphBox(_AbstractBox):
         vertices = []
         tex_coords = []
         baseline = 0
-        x1 = line_x
+        x1 = round(line_x)
         for start, end, baseline_ in context.baseline_iter.ranges(i, i + n_glyphs):
             baseline = layout._parse_distance(baseline_)  # noqa: SLF001
             assert len(self.glyphs[start - i:end - i]) == end - start
             for kern, glyph in self.glyphs[start - i:end - i]:
-                x1 += kern
+                x1 += round(kern)
                 v0, v1, v2, v3 = glyph.vertices
                 v0 += x1
                 v2 += x1
@@ -473,7 +481,7 @@ class _GlyphBox(_AbstractBox):
                 vertices.extend(map(round, [v0, v1, 0, v2, v1, 0, v2, v3, 0, v0, v3, 0]))
                 t = glyph.tex_coords
                 tex_coords.extend(t)
-                x1 += glyph.advance
+                x1 += round(glyph.advance)
 
         # Text color
         colors = []
@@ -514,13 +522,13 @@ class _GlyphBox(_AbstractBox):
         underline_colors = []
         y1 = line_y + self.descent + baseline
         y2 = line_y + self.ascent + baseline
-        x1 = line_x
+        x1 = round(line_x)
 
         for start, end, decoration in context.decoration_iter.ranges(i, i + n_glyphs):
             bg, underline = decoration
             x2 = x1
             for kern, glyph in self.glyphs[start - i:end - i]:
-                x2 += glyph.advance + kern
+                x2 += self._glyph_advance(kern, glyph)
 
             if bg is not None:
                 if len(bg) != 4:
@@ -623,18 +631,19 @@ class _GlyphBox(_AbstractBox):
             if position == 0:
                 break
             position -= 1
-            x += glyph.advance + kern
+            x += self._glyph_advance(kern, glyph)
         return x
 
     def get_position_in_box(self, x: float) -> int:
         position = 0
         last_glyph_x = 0
         for kern, glyph in self.glyphs:
-            last_glyph_x += kern
-            if last_glyph_x + glyph.advance // 2 > x:
+            last_glyph_x += round(kern)
+            advance = round(glyph.advance)
+            if last_glyph_x + advance / 2 > x:
                 return position
             position += 1
-            last_glyph_x += glyph.advance
+            last_glyph_x += advance
         return position
 
     def __repr__(self) -> str:

@@ -48,6 +48,14 @@ class Caret:
     """
     _next_word_re: Pattern[str] = re.compile(r"(?<=\W)\w")
     _previous_word_re: Pattern[str] = re.compile(r"(?<=\W)\w+\W*$")
+    _word_re: Pattern[str] = re.compile(r"\w+", flags=re.UNICODE)
+    # Whole selectable runs: words, punctuation, horizontal whitespace, and
+    # line breaks.  Keeping these categories separate gives predictable
+    # double-click results on repeated punctuation and spaces without making a
+    # run cross a line boundary.
+    _selection_run_re: Pattern[str] = re.compile(
+        r"\w+|[^\w\s]+|[^\S\r\n]+|(?:\r\n|[\r\n])+", flags=re.UNICODE,
+    )
     _next_para_re: Pattern[str] = re.compile(r"\n", flags=re.DOTALL)
     _previous_para_re: Pattern[str] = re.compile(r"\n", flags=re.DOTALL)
 
@@ -326,25 +334,54 @@ class Caret:
         self._next_attributes.clear()
 
     def select_word(self, x: int, y: int) -> None:
-        """Select the word at the given window coordinate."""
+        """Select the word or other selectable run at the given point."""
         line = self._layout.get_line_from_point(x, y)
         p = self._layout.get_position_on_line(line, x)
-        match1 = self._previous_word_re.search(self._layout.document.text, 0, p + 1)
-        if not match1:
-            mark1 = 0
-        else:
-            mark1 = match1.start()
-        self.mark = mark1
+        word = self._get_word_bounds(self._layout.document.text, p)
+        if word is None:
+            return
 
-        match2 = self._next_word_re.search(self._layout.document.text, p)
-        if not match2:
-            mark2 = len(self._layout.document.text)
-        else:
-            mark2 = match2.start()
-
-        self._position = mark2
+        start, end = word
+        self.mark = start
+        self._position = end
         self._update(line=line)
         self._next_attributes.clear()
+
+    @classmethod
+    def _get_word_bounds(cls, text: str, position: int) -> tuple[int, int] | None:
+        """Return the selectable run containing ``position``.
+
+        Word characters are selected as a word, without an adjacent run of
+        whitespace.  Positions immediately at either edge of a word resolve to
+        that word.  Inside a whitespace or punctuation run, the complete run is
+        returned.  An empty document resolves to ``(0, 0)``.
+        """
+        length = len(text)
+        if length == 0:
+            return (0, 0)
+
+        position = max(0, min(position, length))
+
+        # Words take priority on shared boundaries.  In particular, a position
+        # at the end of "alpha" and beginning of its following space must select
+        # "alpha", not "alpha " or the whitespace.
+        for match in cls._word_re.finditer(text):
+            if match.start() <= position <= match.end():
+                return match.span()
+
+        boundary_matches = []
+        for match in cls._selection_run_re.finditer(text):
+            if match.start() <= position <= match.end():
+                if match.start() < position < match.end():
+                    return match.span()
+                boundary_matches.append(match.span())
+
+        if boundary_matches:
+            # At a boundary between two non-word runs, use the run to the
+            # left, matching the usual affinity of an insertion caret.
+            return boundary_matches[0]
+
+        return (position, position)
 
     def select_paragraph(self, x: int, y: int) -> None:
         """Select the paragraph at the given window coordinate."""
