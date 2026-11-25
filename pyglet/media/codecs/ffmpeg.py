@@ -9,7 +9,6 @@ from ctypes import (
     Structure,
     addressof,
     byref,
-    c_char_p,
     c_int,
     c_int32,
     c_uint8,
@@ -55,6 +54,8 @@ from .ffmpeg_lib.libavutil import (
     AV_SAMPLE_FMT_U8P,
     AV_TIME_BASE,
     AV_TIME_BASE_Q,
+    AVERROR_EAGAIN,
+    AVERROR_EOF,
     AVMEDIA_TYPE_AUDIO,
     AVMEDIA_TYPE_VIDEO,
     AVChannelLayout,
@@ -143,6 +144,7 @@ class MemoryFileObject:
         self.file = file
         self.fmt_context = None
         self.buffer = None
+        self.opaque = None
 
         if not getattr(self.file, 'seek', None) or not getattr(self.file, 'tell', None):
             raise Exception("File object does not support seeking.")
@@ -155,6 +157,10 @@ class MemoryFileObject:
         def read_data_cb(_, buff: bytes, buf_size: int) -> int:
             data = self.file.read(buf_size)
             read_size = len(data)
+            if read_size == 0:
+                # AVIO requires AVERROR_EOF at end of file; returning 0 would
+                # make the demuxer retry the same zero-length read forever.
+                return AVERROR_EOF
             memmove(buff, data, read_size)
             return read_size
 
@@ -169,18 +175,26 @@ class MemoryFileObject:
         self.seek_func = libavformat.ffmpeg_seek_func(seek_data_cb)
 
     def __del__(self) -> None:
-        """These are usually freed when the source is, but no guarantee."""
-        if self.buffer:
+        """Last-resort cleanup if the source was never closed explicitly.
+
+        A normally closed FFmpegSource frees these resources itself and sets
+        them to None, so this is a no-op in the common case. The AVIOContext
+        owns the I/O buffer; avio_context_free() releases both, so the buffer
+        must not be freed separately here.
+        """
+        if self.fmt_context:
             try:
-                avutil.av_freep(self.buffer)
+                libavformat.avformat.avio_context_free(byref(self.fmt_context))
             except OSError:
                 pass
 
+    def close(self) -> None:
+        """Free the custom AVIOContext (and its buffer) exactly once."""
         if self.fmt_context:
-            try:
-                avutil.av_freep(self.fmt_context)
-            except OSError:
-                pass
+            libavformat.avformat.avio_context_free(byref(self.fmt_context))
+            self.fmt_context = None
+        self.buffer = None
+        self.opaque = None
 
 
 def ffmpeg_open_memory_file(filename: bytes, file_object: BinaryIO) -> tuple[FFmpegFile, MemoryFileObject]:
@@ -197,9 +211,13 @@ def ffmpeg_open_memory_file(filename: bytes, file_object: BinaryIO) -> tuple[FFm
     memory_file = MemoryFileObject(file_object)
 
     av_buf = libavutil.avutil.av_malloc(memory_file.buffer_size)
-    memory_file.buffer = cast(av_buf, c_char_p)
+    if not av_buf:
+        raise MemoryError('Could not allocate I/O buffer for memory file.')
+    memory_file.buffer = av_buf
 
+    # Keep the opaque object referenced for the lifetime of the AVIOContext.
     ptr = create_string_buffer(memory_file.buffer_size)
+    memory_file.opaque = ptr
 
     memory_file.fmt_context = libavformat.avformat.avio_alloc_context(
         memory_file.buffer,
@@ -211,18 +229,28 @@ def ffmpeg_open_memory_file(filename: bytes, file_object: BinaryIO) -> tuple[FFm
         memory_file.seek_func,
     )
 
+    if not memory_file.fmt_context:
+        libavutil.avutil.av_free(av_buf)
+        memory_file.buffer = None
+        raise FFmpegException('Could not allocate AVIOContext for memory file.')
+
     file.context.contents.pb = memory_file.fmt_context
     file.context.contents.flags |= libavformat.AVFMT_FLAG_CUSTOM_IO
 
     result = avformat.avformat_open_input(byref(file.context), filename, None, None)
 
     if result != 0:
+        # On failure avformat_open_input frees the AVFormatContext itself, but
+        # never the custom AVIOContext handed in through pb.
+        memory_file.close()
         raise FFmpegException('avformat_open_input in ffmpeg_open_filename returned an error opening file '
                               + filename.decode("utf8")
                               + ' Error code: ' + str(result))
 
     result = avformat.avformat_find_stream_info(file.context, None)
     if result < 0:
+        avformat.avformat_close_input(byref(file.context))
+        memory_file.close()
         raise FFmpegException('Could not find stream info')
 
     return file, memory_file
@@ -414,8 +442,6 @@ def ffmpeg_open_stream(file: FFmpegFile, index: int) -> FFmpegStream:
         raise FFmpegException('Could not copy the AVCodecContext.')
     codec_id = codec_context.contents.codec_id
     codec = avcodec.avcodec_find_decoder(codec_id)
-    if _debug:
-        print("Found Codec=", codec_id, "=", codec.contents.long_name.decode())
 
     # VP8 and VP9 default codec don't support alpha transparency.
     # Force libvpx codec in this case.
@@ -428,8 +454,12 @@ def ffmpeg_open_stream(file: FFmpegFile, index: int) -> FFmpegStream:
         codec = newcodec or codec
 
     if not codec:
+        avcodec.avcodec_free_context(byref(codec_context))
         raise FFmpegException('No codec found for this media. '
                               f'codecID={codec_id}')
+
+    if _debug:
+        print("Found Codec=", codec_id, "=", codec.contents.long_name.decode())
 
     codec_id = codec.contents.id
     if _debug:
@@ -437,6 +467,7 @@ def ffmpeg_open_stream(file: FFmpegFile, index: int) -> FFmpegStream:
 
     result = avcodec.avcodec_open2(codec_context, codec, None)
     if result < 0:
+        avcodec.avcodec_free_context(byref(codec_context))
         raise FFmpegException('Could not open the media with the codec.')
 
     stream = FFmpegStream()
@@ -444,6 +475,9 @@ def ffmpeg_open_stream(file: FFmpegFile, index: int) -> FFmpegStream:
     stream.codec_context = codec_context
     stream.type = codec_context.contents.codec_type
     stream.frame = avutil.av_frame_alloc()
+    if not stream.frame:
+        avcodec.avcodec_free_context(byref(codec_context))
+        raise MemoryError('Could not allocate AVFrame.')
     stream.time_base = file.context.contents.streams[index].contents.time_base
 
     return stream
@@ -456,11 +490,23 @@ def ffmpeg_close_stream(stream: FFmpegStream) -> None:
 
 
 def ffmpeg_seek_file(file: FFmpegFile, timestamp: float) -> None:
-    flags = 0
-    max_ts = file.context.contents.duration * AV_TIME_BASE
+    # Seek to the keyframe at or before the target. avformat_seek_file takes a
+    # [min_ts, max_ts] window: passing 0 as the lower bound and the target as
+    # the upper bound lets the demuxer select the correct preceding keyframe
+    # even when a keyframe's DTS precedes its PTS (common in MPEG-TS with
+    # B-frames). Seeking with min==max==target can overshoot that keyframe and
+    # leave the decoder without an IDR frame. The post-seek drain then advances
+    # forward to the requested timestamp.
+    flags = libavformat.AVSEEK_FLAG_BACKWARD
+    duration = file.context.contents.duration
+    if duration != AV_NOPTS_VALUE and duration > 0:
+        max_ts = duration * AV_TIME_BASE
+        # Clamp into [0, duration] so an out-of-range target cannot produce a
+        # bogus timestamp instead of an ordinary seek error.
+        timestamp = min(max(timestamp, 0), max_ts)
     result = avformat.avformat_seek_file(
         file.context, -1, 0,
-        timestamp, timestamp, flags,
+        0, timestamp, flags,
     )
     if result < 0:
         buf = create_string_buffer(128)
@@ -578,29 +624,39 @@ class FFmpegSource(StreamingSource):
     MAX_QUEUE_SIZE = 100
 
     def __init__(self, filename: str, file: BinaryIO | None=None):
+        # Initialise every resource attribute up front so that a failure part
+        # way through construction leaves __del__ with a fully usable object.
         self._packet = None
         self._video_stream = None
         self._audio_stream = None
         self._stream_end = False
         self._file = None
         self._memory_file = None
+        self.img_convert_ctx = POINTER(SwsContext)()
+        self.audio_convert_ctx = None
+        self._closed = False
 
         encoded_filename = filename.encode(sys.getfilesystemencoding())
 
+        try:
+            self._open(encoded_filename, file)
+        except BaseException:
+            # Release anything that was acquired before the exception.
+            self.__del__()
+            raise
+
+    def _open(self, encoded_filename: bytes, file: BinaryIO | None) -> None:
         if file:
             self._file, self._memory_file = ffmpeg_open_memory_file(encoded_filename, file)
         else:
             self._file = ffmpeg_open_filename(encoded_filename)
 
         if not self._file:
-            raise FFmpegException(f'Could not open "{filename}"')
+            raise FFmpegException(f'Could not open "{encoded_filename.decode(sys.getfilesystemencoding())}"')
 
         self._video_stream_index = None
         self._audio_stream_index = None
         self._audio_format = None
-
-        self.img_convert_ctx = POINTER(SwsContext)()
-        self.audio_convert_ctx = None
 
         file_info = ffmpeg_file_info(self._file)
 
@@ -676,6 +732,11 @@ class FFmpegSource(StreamingSource):
         self._events = []  # They don't seem to be used!
 
         self.audioq = deque()
+        # Audio packets already sent to the decoder but not yet resolved into
+        # samples (decoder delay / EAGAIN), kept in decode order.
+        self._pending_audioq: deque[AudioPacket] = deque()
+        # Set once a NULL packet has flushed the audio decoder at EOF.
+        self._audio_draining = False
         # Make queue big enough to accomodate 1.2 sec?
         self._max_len_audioq = self.MAX_QUEUE_SIZE  # Need to figure out a correct amount
         if self.audio_format:
@@ -684,6 +745,15 @@ class FFmpegSource(StreamingSource):
              self._audio_buffer = (c_uint8 * nbytes)()
 
         self.videoq: deque[VideoPacket] = deque()
+        # Decoded RGBA frames waiting to be consumed, as (ImageData, timestamp)
+        # tuples in presentation order. Decoupled from packets so asynchronous
+        # send/receive decoders (B-frame delay) stay correct.
+        self._decoded_video_frames: deque[tuple] = deque()
+        # Number of packets submitted to the decoder without a matching output
+        # frame consumed yet; used to know when more input must be fed.
+        self._video_in_flight = 0
+        # Set once a NULL packet has been sent to flush the decoder at EOF.
+        self._video_draining = False
         self._max_len_videoq = self.MAX_QUEUE_SIZE  # Need to figure out a correct amount
 
         self.start_time = self._get_start_time()
@@ -729,18 +799,44 @@ class FFmpegSource(StreamingSource):
             avutil.av_channel_layout_default(byref(layout), channels)
             return layout
 
+    def close(self) -> None:
+        """Release all FFmpeg resources. Safe to call more than once."""
+        self.__del__()
+
     def __del__(self) -> None:
-        if self._packet and ffmpeg_free_packet is not None:
-            ffmpeg_free_packet(self._packet)
-        if self._video_stream and swscale is not None:
-            swscale.sws_freeContext(self.img_convert_ctx)
-            ffmpeg_close_stream(self._video_stream)
-        if self._audio_stream:
-            if swresample:
-                swresample.swr_free(self.audio_convert_ctx)
+        if getattr(self, '_closed', False):
+            return
+        self._closed = True
+
+        # During interpreter shutdown module globals may already be None; guard
+        # every call so deallocation never raises (which would only print a
+        # traceback and leak the native handle anyway).
+        try:
+            if self._packet is not None and ffmpeg_free_packet is not None:
+                ffmpeg_free_packet(self._packet)
+                self._packet = None
+            if self._video_stream is not None and swscale is not None:
+                if self.img_convert_ctx:
+                    swscale.sws_freeContext(self.img_convert_ctx)
+                    self.img_convert_ctx = POINTER(SwsContext)()
+                ffmpeg_close_stream(self._video_stream)
+                self._video_stream = None
+            if self._audio_stream is not None:
+                if swresample is not None and self.audio_convert_ctx:
+                    swresample.swr_free(self.audio_convert_ctx)
+                    self.audio_convert_ctx = None
                 ffmpeg_close_stream(self._audio_stream)
-        if self._file and ffmpeg_close_file is not None:
-            ffmpeg_close_file(self._file)
+                self._audio_stream = None
+            if self._file is not None and ffmpeg_close_file is not None:
+                ffmpeg_close_file(self._file)
+                self._file = None
+            if self._memory_file is not None:
+                # The custom AVIOContext survives avformat_close_input and has
+                # to be released separately (it also owns its I/O buffer).
+                self._memory_file.close()
+                self._memory_file = None
+        except (OSError, TypeError):
+            pass
 
     def seek(self, timestamp: float) -> None:
         if _debug:
@@ -750,49 +846,45 @@ class FFmpegSource(StreamingSource):
             self._file,
             timestamp_to_ffmpeg(timestamp + self.start_time),
         )
+        # Drop any packets/frames still buffered inside the decoders,
+        # otherwise they would be returned after the seek with timestamps from
+        # the old playback position.
+        if self._video_stream is not None:
+            avcodec.avcodec_flush_buffers(self._video_stream.codec_context)
+        if self._audio_stream is not None:
+            avcodec.avcodec_flush_buffers(self._audio_stream.codec_context)
         del self._events[:]
         self._stream_end = False
         self._clear_video_audio_queues()
         self._fillq()
 
-        # Consume video and audio packets until we arrive at the correct
-        # timestamp location
-        if not self.audio_format:
-            while len(self.videoq) > 1:
-                # We only advance if there is at least 2 packets in the queue
-                # The queue is only left with 1 packet if we have reached the
-                #  end of the stream.
-                if timestamp < self.videoq[1].timestamp:
+        # Discard decoded output until we reach the first frame at or after the
+        # requested timestamp. With a single keyframe at the start, avformat
+        # seeks there and we must decode forward. We drive the decoder directly
+        # so the decision is always based on real frame timestamps, not the
+        # container packet timestamps which may predate the decoded frame.
+        self._drain_to_timestamp(timestamp)
+
+    def _drain_to_timestamp(self, timestamp: float) -> None:
+        """Advance decoders until the next available frame is at/after target.
+
+        Video is the reference clock when present; audio-only sources drain the
+        audio queue instead. Packets consumed while advancing are dropped.
+        """
+        if self.video_format is not None:
+            while True:
+                current_ts = self.get_next_video_timestamp()
+                if current_ts is None:
                     break
-                else:
-                    self.get_next_video_frame(skip_empty_frame=False)
-
-        elif not self.video_format:
-            while len(self.audioq) > 1:
-                # We only advance if there is at least 2 packets in the queue
-                # The queue is only left with 1 packet if we have reached the
-                #  end of the stream.
-                if timestamp < self.audioq[1].timestamp:
+                if current_ts >= timestamp:
                     break
-                else:
-                    self._get_audio_packet()
-
-        else:
-            while len(self.audioq) > 1 and len(self.videoq) > 1:
-                # We only advance if there is at least 2 packets in the queue
-                # The queue is only left with 1 packet if we have reached the
-                #  end of the stream.
-                audioq_is_first = self.audioq[0].timestamp < self.videoq[0].timestamp
-                correct_audio_pos = timestamp < self.audioq[1].timestamp
-                correct_video_pos = timestamp < self.videoq[1].timestamp
-                if audioq_is_first and not correct_audio_pos:
-                    self._get_audio_packet()
-
-                elif not correct_video_pos:
-                    self.get_next_video_frame(skip_empty_frame=False)
-
-                else:
+                # Discard this frame and continue.
+                self.get_next_video_frame(skip_empty_frame=False)
+        elif self.audio_format is not None:
+            while self.audioq:
+                if self.audioq[0].timestamp >= timestamp:
                     break
+                self._get_audio_packet()
 
     def _get_audio_packet(self) -> AudioPacket:
         """Take an audio packet from the queue.
@@ -826,9 +918,16 @@ class FFmpegSource(StreamingSource):
         return video_packet
 
     def _clear_video_audio_queues(self) -> None:
-        """Empty both audio and video queues."""
+        """Empty both audio and video queues, including in-flight state."""
         self.audioq.clear()
         self.videoq.clear()
+        # Decoded frames and decoder bookkeeping are invalidated by the
+        # flush_buffers() performed during a seek.
+        self._pending_audioq.clear()
+        self._audio_draining = False
+        self._decoded_video_frames.clear()
+        self._video_in_flight = 0
+        self._video_draining = False
 
     def _fillq(self) -> None:
         """Fill up both Audio and Video queues if space is available in both"""
@@ -893,6 +992,10 @@ class FFmpegSource(StreamingSource):
         timestamp = duration = 0
 
         while len(data) < num_bytes:
+            # Refill synchronously so playback does not depend on the clock
+            # event loop being pumped.
+            if not self.audioq and not self._stream_end:
+                self._fillq()
             if not self.audioq:
                 break
 
@@ -902,6 +1005,14 @@ class FFmpegSource(StreamingSource):
             if not buffer:
                 break
             data += buffer
+
+        # At end of stream the decoder may still hold a final partial frame.
+        # A NULL packet flushes it; _audio_draining ensures we do this once.
+        if not data and self._stream_end and not self._audio_draining:
+            flushed = self._flush_audio_decoder(compensation_time)
+            if flushed is not None:
+                buffer, timestamp, duration = flushed
+                data += buffer
 
         # No data and no audio queue left
         if not data and not self.audioq:
@@ -927,45 +1038,87 @@ class FFmpegSource(StreamingSource):
         return audio_data
 
     def _decode_audio_packet(self, audio_packet: AudioPacket, compensation_time: float) -> tuple[bytes | None, float, float]:
-        while True:
-            try:
-                size_out = self._ffmpeg_decode_audio(
-                    audio_packet.packet,
-                    self._audio_buffer,
-                    compensation_time)
-            except FFmpegException:
+        # Mirror the video handling: the send/receive decoder can return EAGAIN
+        # while it waits for more input. Accepted packets are parked in
+        # _pending_audioq in order so none is sent twice, and we feed fresh
+        # packets from audioq until samples are produced or the queue is dry.
+        if not self._send_audio_packet(audio_packet):
+            # Input full and nothing could be drained right now; keep the
+            # packet in the caller's queue for a later attempt.
+            return None, 0, 0
+        self._pending_audioq.append(audio_packet)
+
+        while self._pending_audioq:
+            size_out = self._receive_audio_frame(self._audio_buffer, compensation_time)
+            if size_out > 0:
+                self._pending_audioq.popleft()
+                buffer = create_string_buffer(size_out)
+                memmove(buffer, self._audio_buffer, len(buffer))
+                buffer = buffer.raw
+
+                duration = float(len(buffer)) / self.audio_format.bytes_per_second
+                timestamp = ffmpeg_get_frame_ts(self._audio_stream)
+                timestamp = timestamp_from_ffmpeg(timestamp)
+                return buffer, timestamp, duration
+
+            # EAGAIN/EOF: the decoder needs another packet.
+            if not self.audioq:
                 break
-
-            if size_out <= 0:
+            follow_up = self.audioq.popleft()
+            if self._send_audio_packet(follow_up):
+                self._pending_audioq.append(follow_up)
+            else:
+                # Could not accept it: put it back and stop feeding.
+                self.audioq.appendleft(follow_up)
                 break
-
-            buffer = create_string_buffer(size_out)
-            memmove(buffer, self._audio_buffer, len(buffer))
-            buffer = buffer.raw
-
-            duration = float(len(buffer)) / self.audio_format.bytes_per_second
-            timestamp = ffmpeg_get_frame_ts(self._audio_stream)
-            timestamp = timestamp_from_ffmpeg(timestamp)
-            return buffer, timestamp, duration
 
         return None, 0, 0
 
-    def _ffmpeg_decode_audio(self, packet: AVPacket, data_out: Array[c_uint8], compensation_time: float) -> int:
+    def _send_audio_packet(self, audio_packet: AudioPacket) -> bool:
+        """Submit one packet to the audio decoder.
+
+        Returns True if accepted, False if the decoder input is full (EAGAIN)
+        or at EOF.
+        """
         stream = self._audio_stream
-
-        if stream.type != AVMEDIA_TYPE_AUDIO:
-            raise FFmpegException('Trying to decode audio on a non-audio stream.')
-
-        sent_result = avcodec.avcodec_send_packet(
-            stream.codec_context,
-            packet,
-        )
-
+        sent_result = avcodec.avcodec_send_packet(stream.codec_context, audio_packet.packet)
         if sent_result < 0:
+            if sent_result in (AVERROR_EAGAIN, AVERROR_EOF):
+                return False
             buf = create_string_buffer(128)
             avutil.av_strerror(sent_result, buf, 128)
             descr = buf.value
             raise FFmpegException(f'Error occurred sending packet to decoder. {descr.decode()}')
+        return True
+
+    def _flush_audio_decoder(self, compensation_time: float):
+        """Send a NULL packet and pull the decoder's final buffered frame.
+
+        Returns an (buffer, timestamp, duration) tuple, or None when the decoder
+        has nothing left. Runs at most once per source/seek via _audio_draining.
+        """
+        if self._audio_draining:
+            return None
+        self._audio_draining = True
+        stream = self._audio_stream
+        avcodec.avcodec_send_packet(stream.codec_context, None)
+        size_out = self._receive_audio_frame(self._audio_buffer, compensation_time)
+        if size_out <= 0:
+            return None
+        buffer = create_string_buffer(size_out)
+        memmove(buffer, self._audio_buffer, len(buffer))
+        duration = float(len(buffer)) / self.audio_format.bytes_per_second
+        timestamp = ffmpeg_get_frame_ts(stream)
+        timestamp = timestamp_from_ffmpeg(timestamp)
+        return buffer.raw, timestamp, duration
+
+    def _receive_audio_frame(self, data_out: Array[c_uint8], compensation_time: float) -> int:
+        """Receive and resample one audio frame.
+
+        Returns the number of output bytes, or 0 when the decoder has no frame
+        ready yet (EAGAIN) or is drained (EOF).
+        """
+        stream = self._audio_stream
 
         receive_result = avcodec.avcodec_receive_frame(
             stream.codec_context,
@@ -973,12 +1126,17 @@ class FFmpegSource(StreamingSource):
         )
 
         if receive_result < 0:
+            if receive_result in (AVERROR_EAGAIN, AVERROR_EOF):
+                return 0
             buf = create_string_buffer(128)
             avutil.av_strerror(receive_result, buf, 128)
             descr = buf.value
             raise FFmpegException(f'Error occurred receiving frame. {descr.decode()}')
 
-        plane_size = c_int(0)
+        return self._resample_audio_frame(data_out, compensation_time)
+
+    def _resample_audio_frame(self, data_out: Array[c_uint8], compensation_time: float) -> int:
+        stream = self._audio_stream
 
         if avformat_version >= 61:
             channel_count = stream.codec_context.contents.ch_layout.nb_channels
@@ -986,7 +1144,7 @@ class FFmpegSource(StreamingSource):
             channel_count = stream.codec_context.contents.channels
 
         data_size = avutil.av_samples_get_buffer_size(
-            byref(plane_size),
+            byref(c_int(0)),
             channel_count,
             stream.frame.contents.nb_samples,
             stream.codec_context.contents.sample_fmt,
@@ -1046,73 +1204,86 @@ class FFmpegSource(StreamingSource):
 
         return size_out
 
-    def _decode_video_packet(self, video_packet: VideoPacket) -> None:
-        # # Some timing and profiling
-        # pr = cProfile.Profile()
-        # pr.enable()
-        # clock = pyglet.clock.get_default()
-        # t0 = clock.time()
+    def _decode_video_packet(self, video_packet: VideoPacket) -> bool:
+        """Send one packet and drain available frames.
 
+        Returns True if the packet was accepted by the decoder, False if it was
+        refused because the decoder input is full (the caller must retain it).
+        """
         width = self.video_format.width
         height = self.video_format.height
-        pitch = width * 4
-        # https://ffmpeg.org/doxygen/3.3/group__lavc__decoding.html#ga8f5b632a03ce83ac8e025894b1fc307a
-        nbytes = (pitch * height + FF_INPUT_BUFFER_PADDING_SIZE)
-        buffer = (c_uint8 * nbytes)()
-        try:
-            result = self._ffmpeg_decode_video(video_packet.packet, buffer)
-        except FFmpegException:
-            image_data = None
-        else:
-            image_data = image.ImageData(width, height, 'RGBA', buffer, pitch)
+
+        # Submit this packet exactly once, then drain every frame the decoder
+        # can currently emit. Asynchronous decoders (B-frame reordering) may
+        # return EAGAIN on the first packets and emit multiple frames later; the
+        # outer _ensure_decoded_frame() loop keeps feeding packets until a frame
+        # is available. Decoded frames are buffered in presentation order on
+        # _decoded_video_frames, fully decoupled from packet ownership.
+        if not self._send_video_packet(video_packet):
+            return False
+        self._video_in_flight += 1
+
+        while True:
+            pitch = width * 4
+            nbytes = (pitch * height + FF_INPUT_BUFFER_PADDING_SIZE)
+            buffer = (c_uint8 * nbytes)()
+            if not self._receive_video_frame(buffer):
+                break
             timestamp = ffmpeg_get_frame_ts(self._video_stream)
-            timestamp = timestamp_from_ffmpeg(timestamp)
-            video_packet.timestamp = timestamp - self.start_time
+            frame_ts = timestamp_from_ffmpeg(timestamp) - self.start_time
+            self._decoded_video_frames.append(
+                (image.ImageData(width, height, 'RGBA', buffer, pitch), frame_ts))
+            self._video_in_flight -= 1
+        return True
 
-        video_packet.image = image_data
-
-        if _debug:
-            print('Decoding video packet at timestamp', video_packet, video_packet.timestamp)
-
-            # t2 = clock.time()
-            # pr.disable()
-            # print("Time in _decode_video_packet: {:.4f} s for timestamp {} s".format(t2-t0, packet.timestamp))
-            # if t2-t0 > 0.01:
-            #     import pstats
-            #     ps = pstats.Stats(pr).sort_stats("cumulative")
-            #     ps.print_stats()
-
-    def _ffmpeg_decode_video(self, packet: AVPacket, data_out: Array[c_uint8]) -> int:
+    def _begin_video_drain(self) -> None:
+        """Send a NULL packet to the decoder to flush buffered frames at EOF."""
         stream = self._video_stream
-        rgba_ptrs = (POINTER(c_uint8) * 4)()
-        rgba_stride = (c_int * 4)()
-        width = stream.codec_context.contents.width
-        height = stream.codec_context.contents.height
-        if stream.type != AVMEDIA_TYPE_VIDEO:
-            raise FFmpegException('Trying to decode video on a non-video stream.')
+        avcodec.avcodec_send_packet(stream.codec_context, None)
+        self._video_draining = True
 
-        sent_result = avcodec.avcodec_send_packet(
-            stream.codec_context,
-            packet,
-        )
+    def _send_video_packet(self, video_packet: VideoPacket) -> bool:
+        """Submit one packet to the video decoder.
 
+        Returns True if the packet was accepted, False if the decoder input is
+        full (EAGAIN) or at EOF, in which case the caller must keep the packet
+        and try again after draining output.
+        """
+        stream = self._video_stream
+        sent_result = avcodec.avcodec_send_packet(stream.codec_context, video_packet.packet)
         if sent_result < 0:
+            if sent_result in (AVERROR_EAGAIN, AVERROR_EOF):
+                return False
             buf = create_string_buffer(128)
             avutil.av_strerror(sent_result, buf, 128)
             descr = buf.value
             raise FFmpegException(f'Video: Error occurred sending packet to decoder. {descr.decode()}')
+        return True
 
+    def _receive_video_frame(self, data_out: Array[c_uint8]) -> bool:
+        """Pull one decoded frame from the decoder and convert it to RGBA.
+
+        Returns True when a frame was decoded, or False when the decoder has no
+        frame ready yet (EAGAIN) or is drained (EOF).
+        """
+        stream = self._video_stream
         receive_result = avcodec.avcodec_receive_frame(
             stream.codec_context,
             stream.frame,
         )
 
         if receive_result < 0:
+            if receive_result in (AVERROR_EAGAIN, AVERROR_EOF):
+                return False
             buf = create_string_buffer(128)
             avutil.av_strerror(receive_result, buf, 128)
             descr = buf.value
             raise FFmpegException(f'Video: Error occurred receiving frame. {descr.decode()}')
 
+        width = stream.codec_context.contents.width
+        height = stream.codec_context.contents.height
+        rgba_ptrs = (POINTER(c_uint8) * 4)()
+        rgba_stride = (c_int * 4)()
         avutil.av_image_fill_arrays(rgba_ptrs, rgba_stride, data_out,
                                     AV_PIX_FMT_RGBA, width, height, 1)
 
@@ -1130,32 +1301,79 @@ class FFmpegSource(StreamingSource):
                           height,
                           rgba_ptrs,
                           rgba_stride)
-        return receive_result
+        return True
+
+    def _ensure_decoded_frame(self) -> None:
+        """Feed queued packets to the decoder until a frame is available.
+
+        Stops as soon as one decoded frame is buffered, or when both the packet
+        queue and the decoder's internal pipeline are exhausted. The packet
+        queue is refilled synchronously when it runs low, so decoding does not
+        depend on the pyglet clock event loop being pumped.
+        """
+        while not self._decoded_video_frames:
+            # Pull more packets from the demuxer before the queue runs dry.
+            if not self.videoq and not self._stream_end:
+                self._fillq()
+            if self.videoq:
+                video_packet = self.videoq.popleft()
+            elif self._stream_end and not self._video_draining:
+                # No more packets from the demuxer. The decoder may still hold
+                # delayed frames: enter drain mode with a NULL packet.
+                self._begin_video_drain()
+                video_packet = None
+            else:
+                # Already draining, or no input and stream not ended.
+                video_packet = None
+
+            if video_packet is not None:
+                accepted = self._decode_video_packet(video_packet)
+                if not accepted:
+                    # Decoder input is full. Re-queue the packet and try to pull
+                    # a frame from the decoder before sending anything else.
+                    self.videoq.appendleft(video_packet)
+                    width = self.video_format.width
+                    height = self.video_format.height
+                    pitch = width * 4
+                    nbytes = (pitch * height + FF_INPUT_BUFFER_PADDING_SIZE)
+                    buffer = (c_uint8 * nbytes)()
+                    if not self._receive_video_frame(buffer):
+                        return
+                    timestamp = ffmpeg_get_frame_ts(self._video_stream)
+                    frame_ts = timestamp_from_ffmpeg(timestamp) - self.start_time
+                    self._decoded_video_frames.append(
+                        (image.ImageData(width, height, 'RGBA', buffer, pitch), frame_ts))
+                    self._video_in_flight -= 1
+            else:
+                # Poll for delayed output (including frames flushed in drain).
+                width = self.video_format.width
+                height = self.video_format.height
+                pitch = width * 4
+                nbytes = (pitch * height + FF_INPUT_BUFFER_PADDING_SIZE)
+                buffer = (c_uint8 * nbytes)()
+                if not self._receive_video_frame(buffer):
+                    if self._video_draining:
+                        # Decoder fully drained; nothing more will arrive.
+                        self._video_draining = False
+                        self._video_in_flight = 0
+                    return
+                timestamp = ffmpeg_get_frame_ts(self._video_stream)
+                frame_ts = timestamp_from_ffmpeg(timestamp) - self.start_time
+                self._decoded_video_frames.append(
+                    (image.ImageData(width, height, 'RGBA', buffer, pitch), frame_ts))
+                self._video_in_flight -= 1
 
     def get_next_video_timestamp(self) -> int | None:
         if not self.video_format:
             return None
 
-        ts = None
+        self._ensure_decoded_frame()
+        if not self._decoded_video_frames:
+            if _debug:
+                print('Next video timestamp is', None)
+            return None
 
-        if self.videoq:
-            while True:
-                # We skip video packets which are not video frames
-                # This happens in mkv files for the first few frames.
-                try:
-                    video_packet = self.videoq.popleft()
-                except IndexError:
-                    break
-                if video_packet.image == 0:
-                    self._decode_video_packet(video_packet)
-                if video_packet.image is not None:
-                    ts = video_packet.timestamp
-                    self.videoq.appendleft(video_packet)  # put it back
-                    break
-                self._get_video_packet()
-        else:
-            ts = None
-
+        ts = self._decoded_video_frames[0][1]
         if _debug:
             print('Next video timestamp is', ts)
         return ts
@@ -1164,21 +1382,16 @@ class FFmpegSource(StreamingSource):
         if not self.video_format:
             return None
 
-        while True:
-            # We skip video packets which are not video frames
-            # This happens in mkv files for the first few frames.
-            video_packet = self._get_video_packet()
-            if not video_packet:
-                return None
-            if video_packet.image == 0:
-                self._decode_video_packet(video_packet)
-            if video_packet.image is not None or not skip_empty_frame:
-                break
+        self._ensure_decoded_frame()
+        if not self._decoded_video_frames:
+            return None
+
+        image_data, _timestamp = self._decoded_video_frames.popleft()
 
         if _debug:
-            print('Returning', video_packet)
+            print('Returning decoded video frame')
 
-        return video_packet.image
+        return image_data
 
     def _get_start_time(self) -> int:
         def streams() -> Iterator[AVStream]:
@@ -1195,6 +1408,7 @@ class FFmpegSource(StreamingSource):
                 start = stream.start_time
                 if start == AV_NOPTS_VALUE:
                     yield 0
+                    continue
                 start_time = avutil.av_rescale_q(start,
                                                  stream.time_base,
                                                  AV_TIME_BASE_Q)

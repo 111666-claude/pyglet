@@ -14,8 +14,8 @@ _debug = debug_print('debug_media')
 
 avformat = pyglet.lib.load_library(
     'avformat',
-    win32=('avformat-61', 'avformat-60', 'avformat-59', 'avformat-58'),
-    darwin=('avformat.61', 'avformat.60', 'avformat.59', 'avformat.58')
+    win32=('avformat-62', 'avformat-61', 'avformat-60', 'avformat-59', 'avformat-58'),
+    darwin=('avformat.62', 'avformat.61', 'avformat.60', 'avformat.59', 'avformat.58')
 )
 
 avformat.avformat_version.restype = c_int
@@ -151,6 +151,13 @@ for compat_ver in (60, 61):
     compat.add_version_changes('avformat', compat_ver, AVStream, AVStream_Fields,
                                removals=('codec', 'recommended_encoder_configuration', 'info'),
                                repositions=(compat.Reposition("codecpar", "id"),))
+
+# FFmpeg 8 (avformat 62): the stream side_data/nb_side_data fields were
+# removed; codecpar stays positioned right after id as in 7.x.
+compat.add_version_changes('avformat', 62, AVStream, AVStream_Fields,
+                           removals=('codec', 'recommended_encoder_configuration', 'info',
+                                     'side_data', 'nb_side_data'),
+                           repositions=(compat.Reposition("codecpar", "id"),))
 
 
 class AVProgram(Structure):
@@ -315,10 +322,16 @@ if avformat_version >= 61:
                               c_char_p, c_int,
                               POINTER(POINTER(AVDictionary)))),
 
-        ('io_close2', CFUNCTYPE(c_int, POINTER(AVFormatContext), POINTER(AVIOContext)))  # Added in 59.
+        ('io_close2', CFUNCTYPE(c_int, POINTER(AVFormatContext), POINTER(AVIOContext))),  # Added in 59.
+
+        # Added in FFmpeg 8 (avformat 62). Appended at the end, so all earlier
+        # offsets stay identical to the 7.x layout.
+        ('duration_probesize', c_int64),
     ]
 
-    compat.add_version_changes('avformat', 61, AVFormatContext, AVFormatContext_Fields, removals=None)
+    compat.add_version_changes('avformat', 61, AVFormatContext, AVFormatContext_Fields,
+                               removals=('duration_probesize',))
+    compat.add_version_changes('avformat', 62, AVFormatContext, AVFormatContext_Fields, removals=None)
 
 
 else:
@@ -447,13 +460,21 @@ ffmpeg_write_func = CFUNCTYPE(c_int, c_void_p, POINTER(c_char), c_int)
 ffmpeg_seek_func = CFUNCTYPE(c_int64, c_void_p, c_int64, c_int)
 
 avformat.avio_alloc_context.restype = POINTER(AVIOContext)
-avformat.avio_alloc_context.argtypes = [c_char_p, c_int, c_int, c_void_p, ffmpeg_read_func, c_void_p, ffmpeg_seek_func]
+# First argument is an unsigned char* buffer allocated with av_malloc(); use
+# c_void_p so an integer address returned by av_malloc is accepted directly.
+avformat.avio_alloc_context.argtypes = [c_void_p, c_int, c_int, c_void_p, ffmpeg_read_func, c_void_p, ffmpeg_seek_func]
 
 avformat.avformat_alloc_context.restype = POINTER(AVFormatContext)
 avformat.avformat_alloc_context.argtypes = []
 
 avformat.avformat_free_context.restype = c_void_p
 avformat.avformat_free_context.argtypes = [POINTER(AVFormatContext)]
+
+# Available since FFmpeg 4.0 (libavformat 58). Frees an AVIOContext created
+# by avio_alloc_context(), including the I/O buffer it owns.
+avformat.avio_context_free.restype = None
+avformat.avio_context_free.argtypes = [POINTER(POINTER(AVIOContext))]
+
 
 __all__ = [
     'avformat',

@@ -15,8 +15,8 @@ _debug = debug_print('debug_media')
 
 avcodec = pyglet.lib.load_library(
     'avcodec',
-    win32=('avcodec-61', 'avcodec-60', 'avcodec-59', 'avcodec-58'),
-    darwin=('avcodec.61', 'avcodec.60', 'avcodec.59', 'avcodec.58')
+    win32=('avcodec-62', 'avcodec-61', 'avcodec-60', 'avcodec-59', 'avcodec-58'),
+    darwin=('avcodec.62', 'avcodec.61', 'avcodec.60', 'avcodec.59', 'avcodec.58')
 )
 
 avcodec.avcodec_version.restype = c_int
@@ -32,7 +32,8 @@ FF_INPUT_BUFFER_PADDING_SIZE = 32
 class AVPacketSideData(Structure):
     _fields_ = [
         ('data', POINTER(c_uint8)),
-        ('size', c_int),
+        # size_t in the C ABI (sizeof(AVPacketSideData) == 24).
+        ('size', c_size_t),
         ('type', c_int)
     ]
 
@@ -70,6 +71,10 @@ compat.add_version_changes('avcodec', 58, AVPacket, AVPacket_Fields,
 for compat_ver in (59, 60, 61):
     compat.add_version_changes('avcodec', compat_ver, AVPacket, AVPacket_Fields,
                                removals=('convergence_duration',))
+
+# FFmpeg 8 (avcodec 62): AVPacket layout is unchanged from 7.x.
+compat.add_version_changes('avcodec', 62, AVPacket, AVPacket_Fields,
+                           removals=('convergence_duration',))
 
 class AVCodecParserContext(Structure):
     pass
@@ -119,6 +124,10 @@ for compat_ver in (58, 59, 60):
                                removals=('coded_side_data', 'nb_coded_side_data', 'ch_layout', 'framerate'))
 
 compat.add_version_changes('avcodec', 61, AVCodecParameters, AVCodecParameters_Fields,
+                           removals=('channel_layout', 'channels'))
+
+# FFmpeg 8 (avcodec 62): AVCodecParameters layout is unchanged from 7.x.
+compat.add_version_changes('avcodec', 62, AVCodecParameters, AVCodecParameters_Fields,
                            removals=('channel_layout', 'channels'))
 
 
@@ -190,7 +199,188 @@ AV_NUM_DATA_POINTERS = libavutil.AV_NUM_DATA_POINTERS
 
 # Significant deprecation and re-ordering of the entire structure makes it unmanagable to
 # track of all the changes via compat module. Re-define the structure and compat the new one going forward.
-if avcodec_version >= 61:
+if avcodec_version >= 62:
+    # FFmpeg 8 layout. Compared to the 7.x definition below, the deprecated
+    # ticks_per_frame field was removed and get_buffer2 (a callback that is
+    # part of the public C ABI in both 7.x and 8.x) is declared explicitly so
+    # that every field and the struct size match the C offsets exactly.
+    get_buffer2_type = CFUNCTYPE(c_int, POINTER(AVCodecContext), POINTER(AVFrame), c_int)
+    AVCodecContext_Fields = [
+        # Basic fields
+        ("av_class", POINTER(AVClass)),
+        ("log_level_offset", c_int),
+
+        # Codec fields
+        ("codec_type", c_int),  # enum AVMediaType
+        ("codec", POINTER(AVCodec)),
+        ("codec_id", c_int),  # enum AVCodecID
+        ("codec_tag", c_uint),
+
+        ("priv_data", c_void_p),
+        ("internal", POINTER(AVCodecInternal)),
+        ("opaque", c_void_p),
+        ("bit_rate", c_int64),
+        ("flags", c_int),
+        ("flags2", c_int),
+        ("extradata", POINTER(c_uint8)),
+        ("extradata_size", c_int),
+
+        # Timebase
+        ("time_base", AVRational),
+        ("pkt_timebase", AVRational),
+        ("framerate", AVRational),
+
+        # Video fields
+        ("delay", c_int),
+        ("width", c_int),
+        ("height", c_int),
+        ("coded_width", c_int),
+        ("coded_height", c_int),
+        ("sample_aspect_ratio", AVRational),  # AVRational
+        ("pix_fmt", c_int),  # enum AVPixelFormat
+        ("sw_pix_fmt", c_int),  # enum AVPixelFormat
+        ("color_primaries", c_int),  # enum AVColorPrimaries
+        ("color_trc", c_int),  # enum AVColorTransferCharacteristic
+        ("colorspace", c_int),  # enum AVColorSpace
+        ("color_range", c_int),  # enum AVColorRange
+        ("chroma_sample_location", c_int),  # enum AVChromaLocation
+        ("field_order", c_int),  # enum AVFieldOrder
+        ("refs", c_int),
+        ("has_b_frames", c_int),
+        ("slice_flags", c_int),
+
+        ("draw_horiz_band", CFUNCTYPE(None, POINTER(AVCodecContext), POINTER(AVFrame), POINTER(c_int), c_int, c_int, c_int)),
+        ("get_format", CFUNCTYPE(c_int, POINTER(AVCodecContext), POINTER(c_int))),
+
+        # Video encoding parameters
+        ("max_b_frames", c_int),
+        ("b_quant_factor", c_float),
+        ("b_quant_offset", c_float),
+        ("i_quant_factor", c_float),
+        ("i_quant_offset", c_float),
+        ("lumi_masking", c_float),
+        ("temporal_cplx_masking", c_float),
+        ("spatial_cplx_masking", c_float),
+        ("p_masking", c_float),
+        ("dark_masking", c_float),
+        ("nsse_weight", c_int),
+        ("me_cmp", c_int),
+        ("me_sub_cmp", c_int),
+        ("mb_cmp", c_int),
+        ("ildct_cmp", c_int),
+        ("dia_size", c_int),
+        ("last_predictor_count", c_int),
+        ("me_pre_cmp", c_int),
+        ("pre_dia_size", c_int),
+        ("me_subpel_quality", c_int),
+        ("me_range", c_int),
+        ("mb_decision", c_int),
+        ("intra_matrix", POINTER(c_uint16)),
+        ("inter_matrix", POINTER(c_uint16)),
+        ("chroma_intra_matrix", POINTER(c_uint16)),
+        ("intra_dc_precision", c_int),
+        ("mb_lmin", c_int),
+        ("mb_lmax", c_int),
+        ("bidir_refine", c_int),
+        ("keyint_min", c_int),
+        ("gop_size", c_int),
+        ("mv0_threshold", c_int),
+        ("slices", c_int),
+
+        # Audio fields
+        ("sample_rate", c_int),
+        ("sample_fmt", c_int),  # enum AVSampleFormat
+        ("ch_layout", AVChannelLayout),  # AVChannelLayout
+        ("frame_size", c_int),
+        ("block_align", c_int),
+        ("cutoff", c_int),
+        ("audio_service_type", c_int),  # enum AVAudioServiceType
+        ("request_sample_fmt", c_int),  # enum AVSampleFormat
+        ("initial_padding", c_int),
+        ("trailing_padding", c_int),
+        ("seek_preroll", c_int),
+        ("get_buffer2", get_buffer2_type),
+
+        # Encoding parameters
+        ("bit_rate_tolerance", c_int),
+        ("global_quality", c_int),
+        ("compression_level", c_int),
+        ("qcompress", c_float),
+        ("qblur", c_float),
+        ("qmin", c_int),
+        ("qmax", c_int),
+        ("max_qdiff", c_int),
+        ("rc_buffer_size", c_int),
+        ("rc_override_count", c_int),
+        ("rc_override", POINTER(RcOverride)),
+        ("rc_max_rate", c_int64),
+        ("rc_min_rate", c_int64),
+        ("rc_max_available_vbv_use", c_float),
+        ("rc_min_vbv_overflow_use", c_float),
+        ("rc_initial_buffer_occupancy", c_int),
+        ("trellis", c_int),
+        ("stats_out", c_char_p),
+        ("stats_in", c_char_p),
+        ("workaround_bugs", c_int),
+        ("strict_std_compliance", c_int),
+        ("error_concealment", c_int),
+        ("debug", c_int),
+        ("err_recognition", c_int),
+        ("hwaccel", POINTER(AVHWAccel)),
+        ("hwaccel_context", c_void_p),
+        ("hw_frames_ctx", POINTER(AVBufferRef)),
+        ("hw_device_ctx", POINTER(AVBufferRef)),
+        ("hwaccel_flags", c_int),
+        ("extra_hw_frames", c_int),
+        ("error", c_uint64 * AV_NUM_DATA_POINTERS),
+        ("dct_algo", c_int),
+        ("idct_algo", c_int),
+        ("bits_per_coded_sample", c_int),
+        ("bits_per_raw_sample", c_int),
+        ("thread_count", c_int),
+        ("thread_type", c_int),
+        ("active_thread_type", c_int),
+        ("execute",
+         CFUNCTYPE(c_int, POINTER(AVCodecContext), CFUNCTYPE(c_int, POINTER(AVCodecContext), c_void_p), c_void_p,
+                   POINTER(c_int), c_int, c_int)),
+        ("execute2", CFUNCTYPE(c_int, POINTER(AVCodecContext),
+                               CFUNCTYPE(c_int, POINTER(AVCodecContext), c_void_p, c_int, c_int), c_void_p,
+                               POINTER(c_int), c_int)),
+        ("profile", c_int),
+        ("level", c_int),
+        ("properties", c_uint),
+        ("skip_loop_filter", c_int),  # enum AVDiscard
+        ("skip_idct", c_int),  # enum AVDiscard
+        ("skip_frame", c_int),  # enum AVDiscard
+        ("skip_alpha", c_int),
+        ("skip_top", c_int),
+        ("skip_bottom", c_int),
+        ("lowres", c_int),
+        ("codec_descriptor", POINTER(AVCodecDescriptor)),
+        ("sub_charenc", c_char_p),
+        ("sub_charenc_mode", c_int),
+        ("subtitle_header_size", c_int),
+        ("subtitle_header", POINTER(c_uint8)),
+        ("dump_separator", POINTER(c_uint8)),
+        ("codec_whitelist", c_char_p),
+        ("coded_side_data", POINTER(AVPacketSideData)),
+        ("nb_coded_side_data", c_int),
+        ("export_side_data", c_int),
+        ("max_pixels", c_int64),
+        ("apply_cropping", c_int),
+        ("discard_damaged_percentage", c_int),
+        ("max_samples", c_int64),
+        ("get_encode_buffer", CFUNCTYPE(c_int, POINTER(AVCodecContext), POINTER(AVPacket), c_int)),
+        ("frame_num", c_int64),
+        ("side_data_prefer_packet", POINTER(c_int)),
+        ("nb_side_data_prefer_packet", c_uint),
+        ("decoded_side_data", POINTER(POINTER(AVFrameSideData))),
+        ("nb_decoded_side_data", c_int),
+    ]
+
+    compat.add_version_changes('avcodec', 62, AVCodecContext, AVCodecContext_Fields, removals=None)
+
+elif avcodec_version >= 61:
     AVCodecContext_Fields = [
         # Basic fields
         ("av_class", POINTER(AVClass)),

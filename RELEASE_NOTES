@@ -2,7 +2,12 @@ pyglet 2.0.20
 
 Changes and Improvements
 ------------------------
-- media: add support for FFmpeg 7.x
+- media: add support for FFmpeg 8.x (libavcodec 62, libavformat 62, libavutil 60,
+  libswresample 6, libswscale 9)
+- media: handle asynchronous send/receive decoders (EAGAIN) for delayed/B-frame
+  video and audio, fixing first-frame and continuous decode
+- media: seek to the preceding keyframe and flush decoders on seek, preventing
+  stale timestamps; harden custom I/O, truncated/bad-stream and resource cleanup
 
 
 pyglet 2.0.19

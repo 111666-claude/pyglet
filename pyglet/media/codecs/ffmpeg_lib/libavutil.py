@@ -1,5 +1,6 @@
 """Wrapper for include/libavutil/avutil.h
 """
+import errno
 from ctypes import c_char_p, c_void_p, POINTER, Structure, c_double, c_char, Union
 from ctypes import c_int, c_int64, c_uint64
 from ctypes import c_uint8, c_int8, c_uint, c_size_t
@@ -12,8 +13,8 @@ _debug = debug_print('debug_media')
 
 avutil = pyglet.lib.load_library(
     'avutil',
-    win32=('avutil-59', 'avutil-58', 'avutil-57', 'avutil-56'),
-    darwin=('avutil.59', 'avutil.58', 'avutil.57', 'avutil.56')
+    win32=('avutil-60', 'avutil-59', 'avutil-58', 'avutil-57', 'avutil-56'),
+    darwin=('avutil.60', 'avutil.59', 'avutil.58', 'avutil.57', 'avutil.56')
 )
 
 avutil.avutil_version.restype = c_int
@@ -88,7 +89,9 @@ class AVBufferRef(Structure):
     _fields_ = [
         ('buffer', POINTER(AVBuffer)),
         ('data', POINTER(c_uint8)),
-        ('size', c_int)
+        # size_t in the C ABI. It was declared as c_int before, which gave the
+        # wrong struct size (20 instead of 24) and could truncate large sizes.
+        ('size', c_size_t)
     ]
 
 
@@ -201,10 +204,26 @@ compat.add_version_changes('avutil', 59, AVFrame, AVFrame_Fields,
                                      'coded_picture_number', 'display_picture_number', 'reordered_opaque', 'pkt_duration'
                                      ))
 
+# FFmpeg 8 (avutil 60): the remaining deprecated AVFrame fields were removed.
+# key_frame/interlaced_frame/top_field_first are now AV_FRAME_FLAG_* bits in
+# flags; palette_has_changed, pkt_pos and pkt_size were dropped entirely.
+compat.add_version_changes('avutil', 60, AVFrame, AVFrame_Fields,
+                           removals=('pkt_pts', 'error', 'qscale_table', 'qstride', 'qscale_type', 'qp_table_buf',
+                                     'channels', 'channel_layout',
+                                     'coded_picture_number', 'display_picture_number', 'reordered_opaque', 'pkt_duration',
+                                     'key_frame', 'interlaced_frame', 'top_field_first',
+                                     'palette_has_changed', 'pkt_pos', 'pkt_size'))
+
 
 AV_NOPTS_VALUE = -0x8000000000000000
 AV_TIME_BASE = 1000000
 AV_TIME_BASE_Q = AVRational(1, AV_TIME_BASE)
+
+# Error codes returned by the decoding/encoding APIs. AVERROR_EOF is derived
+# from a FourCC tag (see libavutil/error.h); standard errno-based codes such as
+# AVERROR(EAGAIN) are simply the negated errno value.
+AVERROR_EOF = -0x20464F45          # -MKTAG('E', 'O', 'F', ' ')
+AVERROR_EAGAIN = -errno.EAGAIN     # decoder needs more input / output drained
 
 avutil.av_version_info.restype = c_char_p
 avutil.av_dict_get.restype = POINTER(AVDictionaryEntry)
@@ -261,6 +280,8 @@ avutil.av_log_set_level.restype = c_int
 avutil.av_log_set_level.argtypes = [c_uint]
 avutil.av_malloc.restype = c_void_p
 avutil.av_malloc.argtypes = [c_int]
+avutil.av_free.restype = None
+avutil.av_free.argtypes = [c_void_p]
 avutil.av_freep.restype = c_void_p
 avutil.av_freep.argtypes = [c_void_p]
 
@@ -292,6 +313,8 @@ __all__ = [
     'AV_NOPTS_VALUE',
     'AV_TIME_BASE',
     'AV_TIME_BASE_Q',
+    'AVERROR_EOF',
+    'AVERROR_EAGAIN',
     'AVFrame',
     'AVRational',
     'AVDictionary',
